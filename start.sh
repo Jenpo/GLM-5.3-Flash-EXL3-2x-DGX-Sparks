@@ -409,7 +409,7 @@ fi
 
 [ -f "${MODEL_DIR}/config.json" ] || { say "FATAL: ${MODEL_DIR}/config.json missing"; ls -la "${MODEL_DIR}" | head; exit 1; }
 if [ -f /opt/glm53/patch_glm_video_placeholders.py ]; then
-    python3 /opt/glm53/patch_glm_video_placeholders.py || true
+    python3 /opt/glm53/patch_glm_video_placeholders.py
 fi
 say "launching: vllm serve ${MODEL_DIR} ${ARGS[*]}"
 exec vllm serve "${MODEL_DIR}" "${ARGS[@]}"
@@ -464,7 +464,7 @@ fi
 
 [ -f "${MODEL_DIR}/config.json" ] || { say "FATAL: ${MODEL_DIR}/config.json missing"; ls -la "${MODEL_DIR}" | head; exit 1; }
 if [ -f /opt/glm53/patch_glm_video_placeholders.py ]; then
-    python3 /opt/glm53/patch_glm_video_placeholders.py || true
+    python3 /opt/glm53/patch_glm_video_placeholders.py
 fi
 say "joining TP2 at ${HEAD_IP}:${MASTER_PORT} as rank 1"
 exec vllm serve "${MODEL_DIR}" "${ARGS[@]}"
