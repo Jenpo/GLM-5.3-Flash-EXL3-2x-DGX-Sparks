@@ -193,6 +193,7 @@ your cabling differs. `ncclCommInitRank` hangs without them.
 | `GPU_MEM_UTIL` | `0.875` | GB10 UMA budget |
 | `MAX_MODEL_LEN` | `1048576` | native `text_config.max_position_embeddings` |
 | `MAX_NUM_SEQS` | `4` | decode batch; MTP adds k+1 tokens/seq |
+| `MAX_NUM_BATCHED_TOKENS` | `1024` | prefill chunk; 8192 oversubscribes GB10 indexer topk on long context |
 | `LANGUAGE_MODEL_ONLY` | `0` | load vision tower (image + video) |
 | `SKIP_MM_PROFILING` | `1` | skip max-size MM dummy at init (OOM otherwise) |
 | `LIMIT_MM` | `{"image":4,"video":1}` | `--limit-mm-per-prompt` |
@@ -222,6 +223,7 @@ this Dockerfile instead. After CUDA compile, Python overlay edits
 | `tests/test_exl3_overlay.py` | registry, TP shard, `sm_121a` cubin, fused vs loop GEMM, `EXL3_FUSED_MOE=0` |
 | `tests/bench_decode.py` | streaming decode + coherence probes against `:8888` |
 | `start.sh` / `stop.sh` | 2-node launch |
+| `files/chat_template.jinja` | GLM-5.3 MM template (`<|image|>` / `<|video|>`); checkpoint jinja is language-only |
 
 Image-build runs `EXL3_SELFCHECK_GPU=0`. `./start.sh` runs the GPU self-check
 (`docker run --gpus all`) before shipping unless `SKIP_OVERLAY_VERIFY=1`.

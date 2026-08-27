@@ -433,6 +433,7 @@ RUN set -eux; \
 COPY overlay/exl3.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/exl3.py
 COPY overlay/patch_model_overrides.py /opt/glm53/patch_model_overrides.py
 COPY tests/test_exl3_overlay.py /opt/glm53/test_exl3_overlay.py
+COPY files/chat_template.jinja /opt/glm53/chat_template.jinja
 RUN python3 /opt/glm53/patch_model_overrides.py
 
 RUN EXL3_SELFCHECK_GPU=0 python3 /opt/glm53/test_exl3_overlay.py

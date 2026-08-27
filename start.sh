@@ -106,7 +106,10 @@ MTP_TOKENS="${MTP_TOKENS:-2}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-1048576}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.875}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
-MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
+# 8192 chunk × long history oversubscribes GB10 persistent_topk smem (300k crash).
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-1024}"
+CHAT_TEMPLATE_HOST="${CHAT_TEMPLATE_HOST:-$SCRIPT_DIR/files/chat_template.jinja}"
+CHAT_TEMPLATE="${CHAT_TEMPLATE:-/opt/glm53/chat_template.jinja}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 QUANTIZATION="${QUANTIZATION:-exl3}"
 LANGUAGE_MODEL_ONLY="${LANGUAGE_MODEL_ONLY:-0}"
@@ -386,13 +389,16 @@ ARGS=(
 if [ "${MTP_TOKENS:-0}" != "0" ]; then
     ARGS+=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${MTP_TOKENS}}")
 fi
+if [ -n "${CHAT_TEMPLATE:-}" ] && [ -f "${CHAT_TEMPLATE}" ]; then
+    ARGS+=(--chat-template "${CHAT_TEMPLATE}")
+fi
 if [ "${LANGUAGE_MODEL_ONLY:-0}" = "1" ]; then
     ARGS+=(--language-model-only)
     say "language-model-only: no vision tower"
 else
     [ -n "${LIMIT_MM:-}" ] && ARGS+=(--limit-mm-per-prompt "${LIMIT_MM}")
     [ "${SKIP_MM_PROFILING:-1}" = "1" ] && ARGS+=(--skip-mm-profiling)
-    say "vision on: limit-mm=${LIMIT_MM:-} skip-mm-profiling=${SKIP_MM_PROFILING:-1}"
+    say "vision on: limit-mm=${LIMIT_MM:-} skip-mm-profiling=${SKIP_MM_PROFILING:-1} chat-template=${CHAT_TEMPLATE:-}"
 fi
 if [ -n "${EXTRA_ARGS:-}" ]; then
     # shellcheck disable=SC2206
@@ -437,6 +443,9 @@ ARGS=(
 if [ "${MTP_TOKENS:-0}" != "0" ]; then
     ARGS+=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${MTP_TOKENS}}")
 fi
+if [ -n "${CHAT_TEMPLATE:-}" ] && [ -f "${CHAT_TEMPLATE}" ]; then
+    ARGS+=(--chat-template "${CHAT_TEMPLATE}")
+fi
 if [ "${LANGUAGE_MODEL_ONLY:-0}" = "1" ]; then
     ARGS+=(--language-model-only)
 else
@@ -464,6 +473,8 @@ launch_cluster() {
     mkdir -p "$CACHE_ROOT"
     worker_ssh "mkdir -p '$WORKER_VLLM_CACHE'"
     scp -q -o BatchMode=yes "$WORKER_SCRIPT" "${WORKER_SSH}:/tmp/${CONTAINER_WORKER}.sh"
+    [ -f "$CHAT_TEMPLATE_HOST" ] || die "missing chat template: $CHAT_TEMPLATE_HOST"
+    scp -q -o BatchMode=yes "$CHAT_TEMPLATE_HOST" "${WORKER_SSH}:/tmp/glm53-chat_template.jinja"
 
     local -a nccl_common=(
         -e NCCL_IB_DISABLE=0
@@ -514,7 +525,7 @@ launch_cluster() {
     for v in SERVED_MODEL_NAME PORT TP NNODES HEAD_IP MASTER_PORT QUANTIZATION \
              MAX_MODEL_LEN GPU_MEM_UTIL MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS \
              KV_CACHE_DTYPE MTP_TOKENS LANGUAGE_MODEL_ONLY SKIP_MM_PROFILING \
-             LIMIT_MM ENFORCE_EAGER EXL3_FUSED_MOE MODEL_DIR EXTRA_ARGS; do
+             LIMIT_MM CHAT_TEMPLATE ENFORCE_EAGER EXL3_FUSED_MOE MODEL_DIR EXTRA_ARGS; do
         serve_env+=" -e $v='${!v:-}'"
     done
 
@@ -526,6 +537,7 @@ launch_cluster() {
         -v '$WORKER_CACHE_DIR:/root/.cache/huggingface' \
         -v '$WORKER_VLLM_CACHE:/root/.cache/vllm' \
         -v '/tmp/${CONTAINER_WORKER}.sh:/start.sh:ro' \
+        -v '/tmp/glm53-chat_template.jinja:${CHAT_TEMPLATE}:ro' \
         ${worker_preload} \
         ${worker_nccl} \
         -e NCCL_SOCKET_IFNAME='$WORKER_CX7_IF' \
@@ -543,6 +555,7 @@ launch_cluster() {
         -v "$HF_CACHE_DIR:/root/.cache/huggingface" \
         -v "$CACHE_ROOT:/root/.cache/vllm" \
         -v "$HEAD_SCRIPT:/start.sh:ro" \
+        -v "$CHAT_TEMPLATE_HOST:$CHAT_TEMPLATE:ro" \
         "${head_preload[@]}" \
         "${nccl_common[@]}" \
         -e NCCL_SOCKET_IFNAME="$HEAD_CX7_IF" \
@@ -560,6 +573,7 @@ launch_cluster() {
         -e LANGUAGE_MODEL_ONLY="$LANGUAGE_MODEL_ONLY" \
         -e SKIP_MM_PROFILING="$SKIP_MM_PROFILING" \
         -e LIMIT_MM="$LIMIT_MM" \
+        -e CHAT_TEMPLATE="$CHAT_TEMPLATE" \
         -e ENFORCE_EAGER="$ENFORCE_EAGER" \
         -e EXL3_FUSED_MOE="$EXL3_FUSED_MOE" \
         -e MODEL_DIR="$MODEL_DIR" \
