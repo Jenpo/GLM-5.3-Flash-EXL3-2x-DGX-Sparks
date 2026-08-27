@@ -122,8 +122,12 @@ curl -s http://127.0.0.1:8888/v1/chat/completions \
   }'
 ```
 
-Thinking off is **top-level** JSON: `"chat_template_kwargs": {"enable_thinking": false}`
-(nested `extra_body` is ignored). The launcher sets
+Thinking defaults on. Disable it with the **top-level** JSON field
+`"chat_template_kwargs": {"enable_thinking": false}`. This closes the empty
+thinking block in the generation prompt and omits the reasoning-effort hint.
+Do not send a literal nested `extra_body` object over raw HTTP; `extra_body` is
+an OpenAI Python SDK option that merges its contents into the top-level request.
+The launcher sets
 `--chat-template /opt/glm53/chat_template.jinja` (checkpoint jinja is language-only).
 
 Needs: Docker (no sudo) on both nodes, passwordless SSH head → worker,

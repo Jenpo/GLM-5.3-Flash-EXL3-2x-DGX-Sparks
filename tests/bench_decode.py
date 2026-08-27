@@ -51,7 +51,7 @@ def chat_nonstream(prompt: str, max_tokens: int = 64) -> dict:
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
         "max_tokens": max_tokens,
-        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     with _post("/v1/chat/completions", body) as resp:
         raw = resp.read().decode("utf-8")
@@ -69,7 +69,7 @@ def stream_bench(max_tokens: int = 200) -> dict:
         "max_tokens": max_tokens,
         "stream": True,
         "stream_options": {"include_usage": True},
-        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     t0 = time.perf_counter()
     first = None
