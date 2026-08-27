@@ -18,7 +18,7 @@ Do not use the amd64 SM120 image `cstechdev/vllm:glm53-flash-nope-sm120-*`.
 
 Measured on this kit (fused MoE, MTP k=2, enforce-eager): **~24 tok/s decode**
 (3-run median) vs **~10 tok/s** on the old unique-expert Python loop at MTP k=5.
-KV pool **2,051,954 tokens** at util **0.87** language-only; default serve is util **0.85** with vision (image+video).
+KV pool **2,051,954 tokens** at util **0.87** language-only; default serve is util **0.875** with vision (image+video).
 
 ## What runs
 
@@ -73,10 +73,9 @@ the MoE runner all-reduces once per layer.
 
 MLA KV is **~8.7 KiB/token** once indexer + KDA page alignment are included
 (656 B record is only the MLA slab). Language-only at **`GPU_MEM_UTIL=0.87`**
-allocated **19.77 GiB** KV (2,051,954 tokens). Default is **0.85 + vision**:
-the tower is **1.05 GiB BF16** (replicated per rank). At 0.85 language-only KV
-was **16.21 GiB / 1,768,718 tokens**; expect ~**1.65M** after the tower
-(~15.2 GiB). That still covers a native 1M request. Weights + non-torch ~83 GiB
+allocated **19.77 GiB** KV (2,051,954 tokens). Default is **0.875 + vision**:
+the tower is **1.05 GiB BF16** (replicated per rank). Vision at 0.85 was
+**12.63 GiB / 1,494,049 tokens**. That still covers a native 1M request. Weights + non-torch ~83 GiB
 of 121 GiB UMA; vision adds ~1 GiB. Keep **`SKIP_MM_PROFILING=1`** — a max-size
 image+video dummy profile OOMs this UMA. `LIMIT_MM={"image":4,"video":1}`.
 
@@ -191,8 +190,8 @@ your cabling differs. `ncclCommInitRank` hangs without them.
 | `ENFORCE_EAGER` | `1` | graphs fail capture on fused apply |
 | `EXL3_FUSED_MOE` | `1` | `exl3_moe` per layer; `0` = LinearEXL3 loop |
 | `KV_CACHE_DTYPE` | `fp8` | packed `fp8_ds_mla`; not `nvfp4`, not bf16 |
-| `GPU_MEM_UTIL` | `0.85` | GB10 UMA budget (0.87 was language-only) |
-| `MAX_MODEL_LEN` | `1048576` | native `text_config.max_position_embeddings`; ~1.65M KV tokens at 0.85+vision |
+| `GPU_MEM_UTIL` | `0.875` | GB10 UMA budget |
+| `MAX_MODEL_LEN` | `1048576` | native `text_config.max_position_embeddings` |
 | `MAX_NUM_SEQS` | `4` | decode batch; MTP adds k+1 tokens/seq |
 | `LANGUAGE_MODEL_ONLY` | `0` | load vision tower (image + video) |
 | `SKIP_MM_PROFILING` | `1` | skip max-size MM dummy at init (OOM otherwise) |
