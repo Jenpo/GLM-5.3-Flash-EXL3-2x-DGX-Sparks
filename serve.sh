@@ -32,7 +32,7 @@
 
 set -euo pipefail
 
-IMAGE="${IMAGE:-glm53-flash-sm121:local}"
+IMAGE="${IMAGE:-ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3}"
 MODEL_DIR="${MODEL_DIR:-${HOME}/models/GLM-5.3-Flash-EXL3}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-GLM-5.3-Flash}"
 CONTAINER_NAME="${CONTAINER_NAME:-vllm-glm53-flash}"

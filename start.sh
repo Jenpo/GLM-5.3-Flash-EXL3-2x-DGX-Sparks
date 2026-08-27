@@ -14,8 +14,9 @@
 #
 # What we do:
 #   1. preflight  — docker/ssh/disk on both nodes
-#   2. image      — glm53-flash-sm121:local (docker build of this repo). Ship
-#                   to the worker with docker save | ssh docker load.
+#   2. image      — docker pull IMAGE from GHCR if missing; ship to the
+#                   worker with docker save | ssh docker load. BUILD=1
+#                   rebuilds the overlay from this repo instead.
 #   3. download   — EXL3 weights into the local HF cache if missing (~164 GiB)
 #   4. sync       — rsync that cache to the worker (each rank loads local disk)
 #   5. launch     — worker --headless, then head + `vllm serve` (both
@@ -31,7 +32,7 @@
 #   ./start.sh logs worker        follow worker container logs
 #
 # Node IPs live in .env (copied from .env.example on first run).
-# Handy overrides: SKIP_DOWNLOAD=1 SKIP_SYNC=1 PULL=1 TAIL=1 HF_TOKEN=...
+# Handy overrides: SKIP_DOWNLOAD=1 SKIP_SYNC=1 PULL=1 BUILD=1 TAIL=1 HF_TOKEN=...
 # ============================================================================
 set -euo pipefail
 
@@ -62,8 +63,9 @@ set +a
 # ----------------------------- configuration -------------------------------
 MODEL="${MODEL:-brandonmusic/GLM-5.3-Flash-EXL3-4bpw}"
 MODEL_CACHE_NAME="${MODEL_CACHE_NAME:-models--${MODEL//\//--}}"
-IMAGE="${IMAGE:-glm53-flash-sm121:local}"
+IMAGE="${IMAGE:-ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-$MODEL}"
+GHCR_USER="${GHCR_USER:-MiaAI-Lab}"
 
 HEAD_IP="${HEAD_IP:-10.0.0.1}"
 WORKER_IP="${WORKER_IP:-10.0.0.2}"
@@ -222,6 +224,36 @@ preflight() {
 }
 
 # ------------------------------ image --------------------------------------
+image_from_registry() {
+    case "$IMAGE" in
+        */*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+login_ghcr_if_token() {
+    [ -n "${GHCR_TOKEN:-}" ] || return 0
+    log "docker login ghcr.io as ${GHCR_USER} (GHCR_TOKEN)"
+    echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin >/dev/null
+}
+
+build_image() {
+    log "building ${IMAGE} from Dockerfile (log: $LOGDIR/build-sm121.log) ..."
+    docker build -t "$IMAGE" "$SCRIPT_DIR" \
+        >"$LOGDIR/build-sm121.log" 2>&1 \
+        || { tail -n 40 "$LOGDIR/build-sm121.log" >&2; die "docker build of $IMAGE failed"; }
+}
+
+pull_image() {
+    login_ghcr_if_token
+    log "pulling ${IMAGE} ..."
+    docker pull "$IMAGE" && return 0
+    die "docker pull ${IMAGE} failed (GHCR package is private).
+  echo YOUR_PAT | docker login ghcr.io -u YOUR_GITHUB_USER --password-stdin
+  PAT needs read:packages. Or set GHCR_TOKEN + GHCR_USER in .env.
+  Overlay rebuild instead: BUILD=1 ./start.sh"
+}
+
 ship_image_to_worker() {
     log "shipping ${IMAGE} to worker via docker save | ssh docker load ..."
     docker save "$IMAGE" | worker_ssh docker load >/dev/null
@@ -229,7 +261,7 @@ ship_image_to_worker() {
 
 ensure_image() {
     mkdir -p "$LOGDIR"
-    local head_ok=0 worker_ok=0 head_id="" worker_id=""
+    local head_ok=0 worker_ok=0 head_id="" worker_id="" refresh=0
     if docker image inspect "$IMAGE" >/dev/null 2>&1; then
         head_ok=1
         head_id="$(docker image inspect -f '{{.Id}}' "$IMAGE")"
@@ -243,14 +275,18 @@ ensure_image() {
             log "worker image id differs — will ship ${IMAGE}"
         fi
     fi
-    if [ "$head_ok" = "0" ] || [ "${PULL:-0}" = "1" ]; then
-        log "building ${IMAGE} (log: $LOGDIR/build-sm121.log) ..."
-        docker build -t "$IMAGE" "$SCRIPT_DIR" \
-            >"$LOGDIR/build-sm121.log" 2>&1 \
-            || { tail -n 40 "$LOGDIR/build-sm121.log" >&2; die "docker build of $IMAGE failed"; }
-        worker_ok=0
+    if [ "${BUILD:-0}" = "1" ]; then
+        build_image
+        refresh=1
+    elif [ "$head_ok" = "0" ] || [ "${PULL:-0}" = "1" ]; then
+        if image_from_registry && [ "${SKIP_PULL:-0}" != "1" ]; then
+            pull_image
+        else
+            build_image
+        fi
+        refresh=1
     fi
-    if [ "$worker_ok" = "0" ] || [ "${PULL:-0}" = "1" ]; then
+    if [ "$worker_ok" = "0" ] || [ "$refresh" = "1" ]; then
         ship_image_to_worker
     fi
     if [ "${SKIP_OVERLAY_VERIFY:-0}" != "1" ]; then
