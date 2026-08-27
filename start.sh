@@ -100,13 +100,14 @@ MASTER_PORT="${MASTER_PORT:-29521}"
 
 MTP_TOKENS="${MTP_TOKENS:-5}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-1048576}"
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.87}"
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 QUANTIZATION="${QUANTIZATION:-exl3}"
-LANGUAGE_MODEL_ONLY="${LANGUAGE_MODEL_ONLY:-1}"
+LANGUAGE_MODEL_ONLY="${LANGUAGE_MODEL_ONLY:-0}"
 SKIP_MM_PROFILING="${SKIP_MM_PROFILING:-1}"
+LIMIT_MM="${LIMIT_MM:-{\"image\":4,\"video\":1}}"
 TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.1a}"
 FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-12.1a}"
 # Python EXL3 expert loop is not CUDA-graph friendly on this UMA; graphs were
@@ -374,12 +375,13 @@ ARGS=(
 if [ "${MTP_TOKENS:-0}" != "0" ]; then
     ARGS+=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${MTP_TOKENS}}")
 fi
-if [ "${LANGUAGE_MODEL_ONLY:-1}" = "1" ]; then
+if [ "${LANGUAGE_MODEL_ONLY:-0}" = "1" ]; then
     ARGS+=(--language-model-only)
-    say "language-model-only: no vision tower on this GB10"
-fi
-if [ "${SKIP_MM_PROFILING:-1}" = "1" ] && [ "${LANGUAGE_MODEL_ONLY:-1}" != "1" ]; then
-    ARGS+=(--skip-mm-profiling)
+    say "language-model-only: no vision tower"
+else
+    [ -n "${LIMIT_MM:-}" ] && ARGS+=(--limit-mm-per-prompt "${LIMIT_MM}")
+    [ "${SKIP_MM_PROFILING:-1}" = "1" ] && ARGS+=(--skip-mm-profiling)
+    say "vision on: limit-mm=${LIMIT_MM:-} skip-mm-profiling=${SKIP_MM_PROFILING:-1}"
 fi
 if [ -n "${EXTRA_ARGS:-}" ]; then
     # shellcheck disable=SC2206
@@ -424,11 +426,11 @@ ARGS=(
 if [ "${MTP_TOKENS:-0}" != "0" ]; then
     ARGS+=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${MTP_TOKENS}}")
 fi
-if [ "${LANGUAGE_MODEL_ONLY:-1}" = "1" ]; then
+if [ "${LANGUAGE_MODEL_ONLY:-0}" = "1" ]; then
     ARGS+=(--language-model-only)
-fi
-if [ "${SKIP_MM_PROFILING:-1}" = "1" ] && [ "${LANGUAGE_MODEL_ONLY:-1}" != "1" ]; then
-    ARGS+=(--skip-mm-profiling)
+else
+    [ -n "${LIMIT_MM:-}" ] && ARGS+=(--limit-mm-per-prompt "${LIMIT_MM}")
+    [ "${SKIP_MM_PROFILING:-1}" = "1" ] && ARGS+=(--skip-mm-profiling)
 fi
 if [ -n "${EXTRA_ARGS:-}" ]; then
     # shellcheck disable=SC2206
@@ -501,7 +503,7 @@ launch_cluster() {
     for v in SERVED_MODEL_NAME PORT TP NNODES HEAD_IP MASTER_PORT QUANTIZATION \
              MAX_MODEL_LEN GPU_MEM_UTIL MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS \
              KV_CACHE_DTYPE MTP_TOKENS LANGUAGE_MODEL_ONLY SKIP_MM_PROFILING \
-             ENFORCE_EAGER EXL3_FUSED_MOE MODEL_DIR EXTRA_ARGS; do
+             LIMIT_MM ENFORCE_EAGER EXL3_FUSED_MOE MODEL_DIR EXTRA_ARGS; do
         serve_env+=" -e $v='${!v:-}'"
     done
 
@@ -546,6 +548,7 @@ launch_cluster() {
         -e KV_CACHE_DTYPE="$KV_CACHE_DTYPE" -e MTP_TOKENS="$MTP_TOKENS" \
         -e LANGUAGE_MODEL_ONLY="$LANGUAGE_MODEL_ONLY" \
         -e SKIP_MM_PROFILING="$SKIP_MM_PROFILING" \
+        -e LIMIT_MM="$LIMIT_MM" \
         -e ENFORCE_EAGER="$ENFORCE_EAGER" \
         -e EXL3_FUSED_MOE="$EXL3_FUSED_MOE" \
         -e MODEL_DIR="$MODEL_DIR" \

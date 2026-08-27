@@ -18,7 +18,7 @@ Do not use the amd64 SM120 image `cstechdev/vllm:glm53-flash-nope-sm120-*`.
 
 Measured on this kit (fused MoE, MTP k=2, enforce-eager): **~24 tok/s decode**
 (3-run median) vs **~10 tok/s** on the old unique-expert Python loop at MTP k=5.
-KV pool **2,051,954 tokens** at `gpu-memory-utilization 0.87` (fused MTP k=2).
+KV pool **2,051,954 tokens** at util **0.87** language-only; default serve is util **0.85** with vision (image+video).
 
 ## What runs
 
@@ -38,7 +38,7 @@ KV pool **2,051,954 tokens** at `gpu-memory-utilization 0.87` (fused MTP k=2).
 | Spec | MTP, default **`MTP_TOKENS=2`** (measured winner) |
 | Tools / reasoning | `--tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm45` |
 | Graphs | off (`ENFORCE_EAGER=1`) — capture hits a CPU↔CUDA copy in fused apply |
-| Vision | off (`LANGUAGE_MODEL_ONLY=1`) |
+| Vision | on (`LANGUAGE_MODEL_ONLY=0`) — image + video, `--limit-mm-per-prompt {image:4,video:1}`, `--skip-mm-profiling` |
 
 Kernels: `TORCH_CUDA_ARCH_LIST=12.1a`. ExLlamaV3 pin `c5d9c657` (0.0.43) exposes
 `exl3_moe` / `exl3_moe_max_concurrency`; aarch64 CPU allreduce stubs in
@@ -72,10 +72,13 @@ the MoE runner all-reduces once per layer.
 | 0 | fused | **2,326,528** | native, `next_n=1` |
 
 MLA KV is **~8.7 KiB/token** once indexer + KDA page alignment are included
-(656 B record is only the MLA slab). Default is **`GPU_MEM_UTIL=0.87`**: this boot
-allocated **19.77 GiB** KV (2,051,954 tokens). That is **~1.96×** a native 1M
-request (`MAX_MODEL_LEN=1048576`) or 7.83× at 262k. At 0.85 it was ~1.77M tokens.
-Weights + non-torch still ~83 GiB of 121 GiB UMA.
+(656 B record is only the MLA slab). Language-only at **`GPU_MEM_UTIL=0.87`**
+allocated **19.77 GiB** KV (2,051,954 tokens). Default is **0.85 + vision**:
+the tower is **1.05 GiB BF16** (replicated per rank). At 0.85 language-only KV
+was **16.21 GiB / 1,768,718 tokens**; expect ~**1.65M** after the tower
+(~15.2 GiB). That still covers a native 1M request. Weights + non-torch ~83 GiB
+of 121 GiB UMA; vision adds ~1 GiB. Keep **`SKIP_MM_PROFILING=1`** — a max-size
+image+video dummy profile OOMs this UMA. `LIMIT_MM={"image":4,"video":1}`.
 
 **NVFP4 KV is not available here.** `FLASHINFER_MLA_SPARSE_SM120` only lists
 `auto` / `fp8` / `fp8_e4m3` / `fp8_ds_mla`. FlashInfer’s SM12x NVFP4 attention
@@ -188,10 +191,12 @@ your cabling differs. `ncclCommInitRank` hangs without them.
 | `ENFORCE_EAGER` | `1` | graphs fail capture on fused apply |
 | `EXL3_FUSED_MOE` | `1` | `exl3_moe` per layer; `0` = LinearEXL3 loop |
 | `KV_CACHE_DTYPE` | `fp8` | packed `fp8_ds_mla`; not `nvfp4`, not bf16 |
-| `GPU_MEM_UTIL` | `0.87` | GB10 UMA budget |
-| `MAX_MODEL_LEN` | `1048576` | native `text_config.max_position_embeddings`; KV at util 0.87 holds ~2.0× 1M |
+| `GPU_MEM_UTIL` | `0.85` | GB10 UMA budget (0.87 was language-only) |
+| `MAX_MODEL_LEN` | `1048576` | native `text_config.max_position_embeddings`; ~1.65M KV tokens at 0.85+vision |
 | `MAX_NUM_SEQS` | `4` | decode batch; MTP adds k+1 tokens/seq |
-| `LANGUAGE_MODEL_ONLY` | `1` | no vision tower |
+| `LANGUAGE_MODEL_ONLY` | `0` | load vision tower (image + video) |
+| `SKIP_MM_PROFILING` | `1` | skip max-size MM dummy at init (OOM otherwise) |
+| `LIMIT_MM` | `{"image":4,"video":1}` | `--limit-mm-per-prompt` |
 | `HEAD_CX7_IF` / `WORKER_CX7_IF` | `enp1s0f1np1` / `enp1s0f0np0` | NCCL sockets |
 | `HEAD_CX7_IB` / `WORKER_CX7_IB` | `rocep1s0f1` / `rocep1s0f0` | NCCL HCAs |
 | `USE_HOST_NCCL` | `0` | image nvidia-nccl; host preload duplicates DeepEP |
