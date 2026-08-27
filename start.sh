@@ -51,6 +51,8 @@ _cli_mtp="${MTP_TOKENS-}"
 _cli_eager="${ENFORCE_EAGER-}"
 _cli_fused="${EXL3_FUSED_MOE-}"
 _cli_image="${IMAGE-}"
+_cli_util="${GPU_MEM_UTIL-}"
+_cli_lm="${LANGUAGE_MODEL_ONLY-}"
 set -a
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/.env"
@@ -59,6 +61,8 @@ set +a
 [ -n "${_cli_eager}" ] && ENFORCE_EAGER="$_cli_eager"
 [ -n "${_cli_fused}" ] && EXL3_FUSED_MOE="$_cli_fused"
 [ -n "${_cli_image}" ] && IMAGE="$_cli_image"
+[ -n "${_cli_util}" ] && GPU_MEM_UTIL="$_cli_util"
+[ -n "${_cli_lm}" ] && LANGUAGE_MODEL_ONLY="$_cli_lm"
 
 # ----------------------------- configuration -------------------------------
 MODEL="${MODEL:-brandonmusic/GLM-5.3-Flash-EXL3-4bpw}"
@@ -98,7 +102,7 @@ NNODES="${NNODES:-2}"
 PORT="${PORT:-8888}"
 MASTER_PORT="${MASTER_PORT:-29521}"
 
-MTP_TOKENS="${MTP_TOKENS:-5}"
+MTP_TOKENS="${MTP_TOKENS:-2}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-1048576}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
@@ -609,7 +613,9 @@ on_ready() {
     log "  endpoints  : http://127.0.0.1:${PORT}/v1   (LAN: ${HEAD_IP}:${PORT})"
     log "  model name : ${SERVED_MODEL_NAME}"
     log "  weights    : ${MODEL}  quant=${QUANTIZATION}  kv=${KV_CACHE_DTYPE}"
-    log "  features   : tools=glm47+auto, reasoning=glm45, MTP spec-decode (${MTP_TOKENS} tokens)"
+    local vision=on
+    [ "${LANGUAGE_MODEL_ONLY}" = "1" ] && vision=off
+    log "  features   : tools=glm47+auto, reasoning=glm45, MTP k=${MTP_TOKENS}, vision=${vision}"
     log "  quick test :"
     log "    curl -s http://127.0.0.1:${PORT}/v1/chat/completions \\"
     log "      -H 'Content-Type: application/json' \\"
@@ -634,7 +640,7 @@ start() {
 
     MODEL_DIR="$(resolve_model_dir)"
     log "model load path (in-container): ${MODEL_DIR}"
-    log "config: image=${IMAGE} tp=${TP} nnodes=${NNODES} quant=${QUANTIZATION} mtp=${MTP_TOKENS} max-len=${MAX_MODEL_LEN} gpu-util=${GPU_MEM_UTIL} kv=${KV_CACHE_DTYPE} port=${PORT}"
+    log "config: image=${IMAGE} tp=${TP} nnodes=${NNODES} quant=${QUANTIZATION} mtp=${MTP_TOKENS} max-len=${MAX_MODEL_LEN} gpu-util=${GPU_MEM_UTIL} kv=${KV_CACHE_DTYPE} lm-only=${LANGUAGE_MODEL_ONLY} port=${PORT}"
 
     launch_cluster
     if wait_for_health; then

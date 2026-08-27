@@ -205,10 +205,13 @@ your cabling differs. `ncclCommInitRank` hangs without them.
 
 ```bash
 docker build -t glm53-flash-sm121:local .
+# or: BUILD=1 ./start.sh
 ```
 
-`./start.sh` builds this if the tag is missing. After CUDA compile, Python overlay
-edits (`overlay/exl3.py`, tests) are a cheap layer so they do not rebuild
+`./start.sh` **pulls** `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` if
+that tag is missing (`PULL=1` re-pulls). `BUILD=1` rebuilds the overlay from
+this Dockerfile instead. After CUDA compile, Python overlay edits
+(`overlay/exl3.py`, tests) are a cheap layer so they do not rebuild
 `exllamav3_ext`.
 
 | Path | Role |

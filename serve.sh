@@ -37,7 +37,7 @@ MODEL_DIR="${MODEL_DIR:-${HOME}/models/GLM-5.3-Flash-EXL3}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-GLM-5.3-Flash}"
 CONTAINER_NAME="${CONTAINER_NAME:-vllm-glm53-flash}"
 RESTART_POLICY="${RESTART_POLICY:-unless-stopped}"
-PORT="${PORT:-8001}"
+PORT="${PORT:-8888}"
 TP_SIZE="${TP_SIZE:-2}"
 NNODES="${NNODES:-2}"
 NODE_RANK="${NODE_RANK:-0}"
@@ -54,7 +54,7 @@ MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
 # Context costs ~8.7 KiB/token of KV (656 B MLA record + indexer + KDA-aligned
 # pages). 0.95 is the 4x96 GiB number; GB10 UMA "free" counts reclaimable page
 # cache the driver will not give the KV slab. 0.87 is the working budget.
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.87}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.85}"
 ESTIMATE_CUDAGRAPHS="${ESTIMATE_CUDAGRAPHS:-0}"
 # fp8 KV is the only layout the FlashInfer SM12x sparse-MLA kernel takes.
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
@@ -62,7 +62,11 @@ KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 # Outside sm_10x the DeepGEMM fp8 paged MQA logits kernel only serves next_n
 # in (1, 2), so anything above SPEC_TOKENS=1 puts the DSA indexer on its
 # flattening fallback. SPEC_TOKENS=0 disables speculation entirely.
-SPEC_TOKENS="${SPEC_TOKENS:-5}"
+SPEC_TOKENS="${SPEC_TOKENS:-2}"
+LANGUAGE_MODEL_ONLY="${LANGUAGE_MODEL_ONLY:-0}"
+SKIP_MM_PROFILING="${SKIP_MM_PROFILING:-1}"
+LIMIT_MM="${LIMIT_MM:-{\"image\":4,\"video\":1}}"
+EXL3_FUSED_MOE="${EXL3_FUSED_MOE:-1}"
 QUANTIZATION="${QUANTIZATION:-exl3}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
 CACHE_ROOT="${CACHE_ROOT:-${HOME}/.cache/vllm-glm53-flash}"
@@ -128,6 +132,13 @@ EAGER_ARGS=()
 if [ "${ENFORCE_EAGER}" = "1" ]; then
     EAGER_ARGS=(--enforce-eager)
 fi
+MM_ARGS=()
+if [ "${LANGUAGE_MODEL_ONLY}" = "1" ]; then
+    MM_ARGS=(--language-model-only)
+else
+    [ -n "${LIMIT_MM}" ] && MM_ARGS+=(--limit-mm-per-prompt "${LIMIT_MM}")
+    [ "${SKIP_MM_PROFILING}" = "1" ] && MM_ARGS+=(--skip-mm-profiling)
+fi
 
 DIST_ARGS=()
 if [ "${NNODES}" -gt 1 ]; then
@@ -170,6 +181,7 @@ docker run \
     --env OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}" \
     --env NCCL_DEBUG="${NCCL_DEBUG}" \
     --env NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX}" \
+    --env EXL3_FUSED_MOE="${EXL3_FUSED_MOE}" \
     --volume "${MODEL_DIR}":/model:ro \
     --volume "${CACHE_ROOT}":/root/.cache \
     "${IMAGE}" \
@@ -189,6 +201,7 @@ docker run \
     --enable-auto-tool-choice \
     --tool-call-parser glm47 \
     --reasoning-parser glm45 \
+    "${MM_ARGS[@]}" \
     "${QUANT_ARGS[@]}" \
     "${DIST_ARGS[@]}" \
     "${SPEC_ARGS[@]}"
