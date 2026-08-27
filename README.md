@@ -19,7 +19,7 @@ KV pool **2,051,954 tokens** at `gpu-memory-utilization 0.87` (fused MTP k=2).
 |---|---|
 | API | vLLM OpenAI (`/v1/chat/completions`) on the head, port **8888** |
 | Model id | `brandonmusic/GLM-5.3-Flash-EXL3-4bpw` |
-| Image | `glm53-flash-sm121:local` FROM `vllm/vllm-openai:glm53-flash-arm64-cu130@sha256:905c0293…` (arm64, CUDA 13.0) |
+| Image | `glm53-flash-sm121:local` (= `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3`) FROM `vllm/vllm-openai:glm53-flash-arm64-cu130@sha256:905c0293…` (arm64, CUDA 13.0) |
 | Executor | `mp`, `--nnodes 2`, `--tensor-parallel-size 2` |
 | Head | this machine, `HEAD_IP=10.0.0.1`, container `glm53-exl3-head` |
 | Worker | `WORKER_USER@WORKER_IP` (this kit: `zurih@10.0.0.2`), `--headless`, `glm53-exl3-worker` |
@@ -121,7 +121,7 @@ wins over `.env` (`MTP_TOKENS=1 SKIP_DOWNLOAD=1 ./start.sh restart`).
 `./start.sh` will:
 
 1. Preflight docker/ssh/disk on both nodes
-2. Build `glm53-flash-sm121:local` if missing; `docker save | ssh docker load` onto the worker (or whenever head/worker image Ids differ)
+2. Build `glm53-flash-sm121:local` if missing (or `docker pull` the GHCR tag below); `docker save | ssh docker load` onto the worker (or whenever head/worker image Ids differ)
 3. Download the EXL3 repo into `$HF_HOME` / `~/.cache/huggingface` (~164 GiB, 120 shards)
 4. `rsync` that cache to `${WORKER_HOME}/.cache/huggingface`
 5. Start rank 1 `--headless` on the worker, rank 0 + API on the head
@@ -135,6 +135,15 @@ PULL=1 SKIP_DOWNLOAD=1 SKIP_SYNC=1 ./start.sh restart   # rebuild overlay + ship
 ./start.sh logs worker
 ./start.sh stop                # or ./stop.sh
 ```
+
+Private image copy on GHCR (MiaAI-Lab members; same digest as `glm53-flash-sm121:local`):
+
+```bash
+docker pull ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3
+docker tag  ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3 glm53-flash-sm121:local
+```
+
+Or set `IMAGE=ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` in `.env`. Do not pull `glm53-flash-sm121:v8` — that is the older NVFP4/Ray kernel.
 
 API: `http://127.0.0.1:8888/v1` (LAN: `http://10.0.0.1:8888/v1`).
 
@@ -164,7 +173,7 @@ your cabling differs. `ncclCommInitRank` hangs without them.
 | `WORKER_USER` | *(unset = `$USER`)* | SSH user on the worker |
 | `WORKER_HOME` | `$HOME` if same user, else `/home/$WORKER_USER` | worker HF cache |
 | `MODEL` | `brandonmusic/GLM-5.3-Flash-EXL3-4bpw` | Hub repo into the HF cache |
-| `IMAGE` | `glm53-flash-sm121:local` | serve image |
+| `IMAGE` | `glm53-flash-sm121:local` | serve image (GHCR: `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3`) |
 | `PORT` | `8888` | OpenAI API on the head |
 | `TP` / `NNODES` | `2` / `2` | do not change for this recipe |
 | `QUANTIZATION` | `exl3` | overlay method; never `marlin` |
