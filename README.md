@@ -224,6 +224,7 @@ this Dockerfile instead. After CUDA compile, Python overlay edits
 | `tests/bench_decode.py` | streaming decode + coherence probes against `:8888` |
 | `start.sh` / `stop.sh` | 2-node launch |
 | `files/chat_template.jinja` | GLM-5.3 MM template (`<|image|>` / `<|video|>`); checkpoint jinja is language-only |
+| `overlay/patch_glm_video_placeholders.py` | align video timestamp blocks to encoder `grid_t` (100 vs 300 crash) |
 
 Image-build runs `EXL3_SELFCHECK_GPU=0`. `./start.sh` runs the GPU self-check
 (`docker run --gpus all`) before shipping unless `SKIP_OVERLAY_VERIFY=1`.
