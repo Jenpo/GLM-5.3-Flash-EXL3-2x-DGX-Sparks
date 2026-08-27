@@ -22,15 +22,12 @@ def _align_timestamps(timestamps: list, t_groups: int) -> list:
 
 def apply() -> None:
     from vllm.model_executor.models.glm4_1v import (
-        TRANSFORMERS_WITH_GA,
         Glm4vProcessingInfo,
         Glm4vProcessor,
     )
 
     if getattr(Glm4vProcessingInfo, "_glm53_video_t_aligned", False):
         return
-
-    orig = Glm4vProcessingInfo._construct_video_placeholder
 
     def _construct_video_placeholder(self, video_array, metadata, grid_thw):
         hf_processor = self.get_hf_processor()
@@ -42,7 +39,9 @@ def apply() -> None:
         t_groups, height, width = int(t_hw[0]), int(t_hw[1]), int(t_hw[2])
         n_per = int(height * width) // merge_length
 
-        if isinstance(hf_processor, Glm4vProcessor) or TRANSFORMERS_WITH_GA:
+        # Glm5NextVideoProcessor has no max_duration; glm4v timestamps crash.
+        name = type(hf_processor).__name__
+        if isinstance(hf_processor, Glm4vProcessor) and "Glm5" not in name:
             timestamps = self._get_video_second_idx_glm4v(metadata, len(video_array))
             ts_fmt = "{}"
         elif self._is_glmga_model(hf_processor):
@@ -109,6 +108,26 @@ except Exception:
     pass
 
 
+def _disable_gb10_persistent_topk() -> None:
+    """Decode-path persistent_topk oversubscribes GB10 smem on long seqs."""
+    from pathlib import Path
+
+    p = Path(
+        "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/"
+        "sparse_attn_indexer_kpool.py"
+    )
+    if not p.is_file():
+        return
+    text = p.read_text()
+    old = "if current_platform.is_cuda() and select_k in (512, 1024, 2048):"
+    new = (
+        "if False and current_platform.is_cuda() and "
+        "select_k in (512, 1024, 2048):  # GB10 persistent_topk smem"
+    )
+    if old in text:
+        p.write_text(text.replace(old, new, 1))
+
+
 if __name__ == "__main__":
     import shutil
     from pathlib import Path
@@ -119,3 +138,4 @@ if __name__ == "__main__":
     Path("/usr/local/lib/python3.12/dist-packages/glm53_video.pth").write_text(
         "import glm53_video_patch\n"
     )
+    _disable_gb10_persistent_topk()
