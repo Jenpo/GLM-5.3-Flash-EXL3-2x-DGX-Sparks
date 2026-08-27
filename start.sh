@@ -121,9 +121,15 @@ if [ -z "${LIMIT_MM:-}" ]; then
 fi
 TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.1a}"
 FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-12.1a}"
-# Python EXL3 expert loop is not CUDA-graph friendly on this UMA; graphs were
-# ~+2% on prior GB10 GLM work anyway.
-ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
+# Graph-safe fused apply (device-side expert grouping). MTP k=2 decode is
+# 1..4 seqs × 3 tokens; capture sizes must include 3 or vLLM pads and loses.
+ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
+if [ "${ENFORCE_EAGER}" != "1" ]; then
+    case " ${EXTRA_ARGS:-} " in
+        *" --cudagraph-capture-sizes "*|*" cudagraph-capture-sizes "*) ;;
+        *) EXTRA_ARGS="${EXTRA_ARGS:+$EXTRA_ARGS }--cudagraph-capture-sizes 1 2 3 4 6 8 12" ;;
+    esac
+fi
 # 1 = fused exl3_moe (decode). 0 restores the unique-expert LinearEXL3 loop.
 EXL3_FUSED_MOE="${EXL3_FUSED_MOE:-1}"
 

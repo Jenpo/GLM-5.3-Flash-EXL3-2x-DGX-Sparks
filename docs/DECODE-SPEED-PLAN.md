@@ -301,6 +301,8 @@ Write results into the table below and into
 | 2a-k0 | flags only | 200 | FLASHINFER_MLA_SPARSE_SM120 | loop | 1 | 0 | 2,299,717 | 1.09 | 8.43 | yes | no | pure AR next_n=1 flattening=False; slowest |
 | 1 | fused exl3_moe | 200 | FLASHINFER_MLA_SPARSE_SM120 | **exl3_moe** | 1 | 2 | 1,988,678 | 0.45 | 23.74 | yes | yes | 2.37× Phase 0; 1.93× loop-k2; concurrency=6; Paris/9.9>9.11/sky-blue |
 | 1.4 | fused + graphs | fail | FLASHINFER_MLA_SPARSE_SM120 | exl3_moe | 0 | 2 | — | — | — | n/a | no | capture: CPU↔CUDA copy (argsort/bincount); abort to ENFORCE_EAGER=1 |
+| 1.4b | graph-safe apply, sizes 6 12 24 | 200 | FLASHINFER_MLA_SPARSE_SM120 | exl3_moe | 0 | 2 | ~1.97M | 0.54 | 19.95 | yes | no | capture OK; padded MTP 3→6; −16% vs eager |
+| 1.4c | graph-safe apply, sizes 1 2 3 4 6 8 12 | 200 | FLASHINFER_MLA_SPARSE_SM120 | **exl3_moe** | 0 | 2 | ~1.97M | 0.45 | **24.55** | yes | **winner** | +3.4% vs fused eager; overlay pin+scatter_add_+num_active=-1 |
 | 2b-k5 | fused | 200 | FLASHINFER_MLA_SPARSE_SM120 | exl3_moe | 1 | 5 | 1,564,672 | 0.56 | 19.83 | yes | no | flattening next_n=6; slower than fused k=2 |
 | 2b-k2 | fused | 200 | FLASHINFER_MLA_SPARSE_SM120 | exl3_moe | 1 | 2 | 1,988,678 | 0.45 | 23.74 | yes | **winner** | same as Phase 1; 2.37× Phase 0 |
 | 2b-k1 | fused | 200 | FLASHINFER_MLA_SPARSE_SM120 | exl3_moe | 1 | 1 | 1,785,075 | 0.45 | 20.65 | yes | no | native next_n=2; slower than fused k=2 |

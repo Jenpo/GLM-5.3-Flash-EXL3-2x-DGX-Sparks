@@ -172,8 +172,27 @@ def load_exllamav3_ext():
 
 
 def _exl3_moe_accepts_num_active(fn) -> bool:
+    try:
+        import inspect
+
+        if "num_active" in inspect.signature(fn).parameters:
+            return True
+    except (TypeError, ValueError):
+        pass
     doc = getattr(fn, "__doc__", None) or ""
-    return "arg29" in doc or doc.count("arg") >= 30
+    return "num_active" in doc or "arg29" in doc or doc.count("arg") >= 30
+
+
+def pin_exl3_expert_map(
+    layer: torch.nn.Module, device: torch.device
+) -> torch.Tensor | None:
+    """Move expert_map onto `device` once. CUDA graph capture forbids a CPU→GPU copy."""
+    emap = getattr(layer, "expert_map", None)
+    if emap is None:
+        return None
+    if emap.device != device or emap.dtype != torch.long:
+        layer.expert_map = emap.to(device=device, dtype=torch.long)
+    return layer.expert_map
 
 
 def map_topk_to_local(
@@ -181,15 +200,22 @@ def map_topk_to_local(
     n_local: int,
     expert_map: torch.Tensor | None,
 ) -> torch.Tensor:
-    """ids (T, K) global expert ids → local ids, invalid/non-local → n_local sentinel."""
+    """ids (T, K) global expert ids → local ids, invalid/non-local → n_local sentinel.
+
+    `expert_map` must already live on `ids.device` (see pin_exl3_expert_map).
+    """
     flat = ids.reshape(-1)
     if expert_map is None:
         invalid = (flat < 0) | (flat >= n_local)
         return torch.where(invalid, flat.new_full(flat.shape, n_local), flat)
-    emap = expert_map.to(device=flat.device, dtype=torch.long)
-    n_global = int(emap.numel())
+    if expert_map.device != flat.device or expert_map.dtype != torch.long:
+        raise RuntimeError(
+            "EXL3 expert_map is not pinned to the hidden-state device; "
+            "call pin_exl3_expert_map before fused apply (CUDA graphs forbid the copy)"
+        )
+    n_global = int(expert_map.numel())
     safe = flat.clamp(min=0, max=max(n_global - 1, 0))
-    mapped = emap[safe] if n_global else flat.new_full(flat.shape, n_local)
+    mapped = expert_map[safe] if n_global else flat.new_full(flat.shape, n_local)
     invalid = (flat < 0) | (flat >= n_global) | (mapped < 0) | (mapped >= n_local)
     return torch.where(invalid, flat.new_full(flat.shape, n_local), mapped)
 
@@ -308,17 +334,18 @@ def apply_exl3_fused_moe(
     order = local.argsort()
     token_sorted = flat_token[order]
     weight_sorted = flat_weight[order]
-    expert_count = torch.bincount(local, minlength=n_exp + 1)
+    # scatter_add stays on GPU. torch.bincount can host-stage and break CUDA graphs.
+    expert_count = torch.zeros(n_exp + 1, dtype=torch.long, device=local.device)
+    expert_count.scatter_add_(
+        0, local.long(), torch.ones(local.shape, dtype=torch.long, device=local.device)
+    )
     out = torch.zeros(tokens, hidden, dtype=torch.float32, device=x2d.device)
     xh = x2d.contiguous().half()
 
     counts = expert_count[:n_exp]
-    num_active = (counts > 0) & (counts <= TEMP_ROWS_FUSED)
-    # Host int only if this cubin takes num_active; otherwise skip the extra sync.
-    n_active_host = None
     fn = exllamav3_ext.exl3_moe
-    if _exl3_moe_accepts_num_active(fn):
-        n_active_host = int(num_active.sum().item())
+    # -1 = unknown active count: max-concurrency grid, no .item() host sync.
+    n_active_host = -1 if _exl3_moe_accepts_num_active(fn) else None
 
     k = int(getattr(layer, "_exl3_k", 4))
     args = (
@@ -390,7 +417,7 @@ def apply_exl3_experts(
     x2d = x.reshape(tokens, hidden)
     ids = topk_ids.reshape(tokens, -1).to(torch.long)
     weights = topk_weights.reshape(tokens, -1)
-    expert_map = getattr(layer, "expert_map", None)
+    expert_map = pin_exl3_expert_map(layer, x2d.device)
     have_ptrs = bool(getattr(layer, "_exl3_ptrs", None))
     if fused is True and not have_ptrs:
         raise RuntimeError("EXL3 fused apply requested but pointer tables are missing")

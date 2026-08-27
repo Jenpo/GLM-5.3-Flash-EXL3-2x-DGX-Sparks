@@ -120,6 +120,7 @@ def _check_gpu_gemm() -> None:
     )
     _check_fused_vs_loop(device)
     _check_apply_expert_map(device)
+    _check_fused_cudagraph(device)
 
 
 def _tiny_layer(device, n_exp: int = 3, hidden: int = 256, inter: int = 256):
@@ -218,6 +219,39 @@ def _check_apply_expert_map(device) -> None:
         else:
             os.environ["EXL3_FUSED_MOE"] = prev
     print("exl3 apply expert_map -1 + EXL3_FUSED_MOE=0 loop OK", flush=True)
+
+
+def _check_fused_cudagraph(device) -> None:
+    import torch
+    from vllm.model_executor.layers.quantization.exl3 import apply_exl3_experts
+
+    _method, layer = _tiny_layer(device, n_exp=3)
+    # CPU map: first eager apply must pin it so capture does not CPU→CUDA copy.
+    layer.expert_map = torch.tensor([0, -1, 2], dtype=torch.long, device="cpu")
+    x = torch.randn(2, 256, dtype=torch.float16, device=device)
+    ids = torch.tensor([[0, 1], [2, 1]], dtype=torch.long, device=device)
+    w = torch.tensor([[0.7, 0.3], [0.4, 0.6]], dtype=torch.float16, device=device)
+    static_x = x.clone()
+    static_ids = ids.clone()
+    static_w = w.clone()
+    y_eager = apply_exl3_experts(static_x, static_ids, static_w, layer, fused=True)
+    assert layer.expert_map.device.type == "cuda", layer.expert_map.device
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            apply_exl3_experts(static_x, static_ids, static_w, layer, fused=True)
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        y_graph = apply_exl3_experts(static_x, static_ids, static_w, layer, fused=True)
+    g.replay()
+    torch.cuda.synchronize()
+    err = float((y_graph.float() - y_eager.float()).abs().max())
+    bound = max(0.15, 0.08 * float(y_eager.float().abs().max().clamp_min(1.0)))
+    assert torch.isfinite(y_graph).all(), y_graph
+    assert err < bound, f"cudagraph vs eager maxabs={err} bound={bound}"
+    print(f"exl3 fused CUDA graph capture OK maxabs={err:.5f}", flush=True)
 
 
 def main() -> int:

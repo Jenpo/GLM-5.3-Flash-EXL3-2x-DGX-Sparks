@@ -16,9 +16,8 @@ kit: tensor-parallel size 2 over CX7, native `sm_121a` cubins, API on `:8888`.
 This is **EXL3 weights + fp8 KV**, not NVFP4. Do not pass `--moe-backend marlin`.
 Do not use the amd64 SM120 image `cstechdev/vllm:glm53-flash-nope-sm120-*`.
 
-Measured on this kit (fused MoE, MTP k=2, enforce-eager): **~24 tok/s decode**
-(3-run median) vs **~10 tok/s** on the old unique-expert Python loop at MTP k=5.
-KV pool **2,051,954 tokens** at util **0.87** language-only; default serve is util **0.875** with vision (image+video).
+Measured on this kit (fused MoE, MTP k=2, CUDA graphs): **~24.6 tok/s decode**.
+KV pool **1,771,613 tokens** (util **0.875**, vision on, CUDA graphs).
 
 ## What runs
 
@@ -32,12 +31,12 @@ KV pool **2,051,954 tokens** at util **0.87** language-only; default serve is ut
 | Worker | `WORKER_USER@WORKER_IP` (this kit: `zurih@10.0.0.2`), `--headless`, `glm53-exl3-worker` |
 | Fabric | CX7 QSFP: `enp1s0f1np1`/`rocep1s0f1` ↔ `enp1s0f0np0`/`rocep1s0f0`. Image NCCL (`USE_HOST_NCCL=0`) |
 | Attention | `FLASHINFER_MLA_SPARSE_SM120` (NoPE MLA padded into GLM_NSA 576-wide) |
-| KV | `--kv-cache-dtype fp8` → packed **`fp8_ds_mla`**, 656 B/token MLA record |
+| KV | `--kv-cache-dtype fp8` → packed **`fp8_ds_mla`** |
 | Experts | packed trellis + suh + svh + mcg, codebook MCG, **one fused `exllamav3_ext.exl3_moe` launch per layer** |
 | Dense / shared / attn / embed / lm_head | native (unquantized) |
-| Spec | MTP, default **`MTP_TOKENS=2`** (measured winner) |
+| Spec | MTP, default **`MTP_TOKENS=2`** |
 | Tools / reasoning | `--tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm45` |
-| Graphs | off (`ENFORCE_EAGER=1`) — capture hits a CPU↔CUDA copy in fused apply |
+| Graphs | on (`ENFORCE_EAGER=0`) — capture sizes `1 2 3 4 6 8 12` (must include 3 for MTP k=2) |
 | Vision | on (`LANGUAGE_MODEL_ONLY=0`) — image + video, `--limit-mm-per-prompt {image:4,video:1}`, `--skip-mm-profiling` |
 
 Kernels: `TORCH_CUDA_ARCH_LIST=12.1a`. ExLlamaV3 pin `c5d9c657` (0.0.43) exposes
@@ -59,94 +58,22 @@ svh + mcg** and run Trellis/MCG. Shared experts, attention, embeddings, and
 `lm_head` stay native. TP=2 shards gate/up **column-wise** and down **row-wise**;
 the MoE runner all-reduces once per layer.
 
+`overlay/patch_glm_video_placeholders.py` routes Glm5Next video timestamps through
+the glm46v path and aligns placeholder blocks to encoder `grid_t`. The overlay
+also disables GB10 `persistent_topk` so long-history decode uses
+`top_k_per_row_decode`.
+
 ## KV cache
 
 `--kv-cache-dtype fp8` is required. The SM12x sparse-MLA kernel only accepts packed
-`fp8_ds_mla`. **bf16 KV has no sparse kernel** on this arch.
+`fp8_ds_mla`. **bf16 KV has no sparse kernel** on this arch. Default pool:
+**1,771,613 tokens**. That covers a native 1M request.
 
-| MTP k | MoE | KV tokens (util 0.85, this kit) | Indexer |
-|---:|---|---:|---|
-| 5 | fused | 1,564,672 | flattening, `next_n=6` |
-| **2 (default)** | **fused** | **2,051,954** at util **0.87** (1,768,718 at 0.85) | flattening, `next_n=3` |
-| 1 | fused | 1,785,075 | native DeepGEMM, `next_n=2` |
-| 0 | fused | **2,326,528** | native, `next_n=1` |
+Keep **`SKIP_MM_PROFILING=1`** — a max-size image+video dummy profile OOMs this UMA.
+`LIMIT_MM={"image":4,"video":1}`.
 
-MLA KV is **~8.7 KiB/token** once indexer + KDA page alignment are included
-(656 B record is only the MLA slab). Language-only at **`GPU_MEM_UTIL=0.87`**
-allocated **19.77 GiB** KV (2,051,954 tokens). Default is **0.875 + vision**:
-the tower is **1.05 GiB BF16** (replicated per rank). Vision at 0.85 was
-**12.63 GiB / 1,494,049 tokens**. That still covers a native 1M request. Weights + non-torch ~83 GiB
-of 121 GiB UMA; vision adds ~1 GiB. Keep **`SKIP_MM_PROFILING=1`** — a max-size
-image+video dummy profile OOMs this UMA. `LIMIT_MM={"image":4,"video":1}`.
-
-**NVFP4 KV is not available here.** `FLASHINFER_MLA_SPARSE_SM120` only lists
-`auto` / `fp8` / `fp8_e4m3` / `fp8_ds_mla`. FlashInfer’s SM12x NVFP4 attention
-kernels are **dense MHA** (XQA/FA2), not sparse MLA. Adding `nvfp4` to the Python
-dtype list will fail backend selection or `concat_and_cache_mla`. A real NVFP4
-sparse-MLA cache would need new SM121 kernels plus a new packed write path — not
-an `.env` flag. Do not confuse that with NVFP4 **weights** (`--moe-backend marlin`).
-
-## Decode speed (this kit)
-
-Protocol: thinking off, temp 0, 200 tokens, 3 streaming runs, median.
-Prompt: hash-map explanation (see `tests/bench_decode.py`). Decode tok/s =
-`(completion_tokens - 1) / (end - first_token_time)`.
-
-| MoE | MTP k | tok/s med | TTFT med (s) | Keep |
-|---|---:|---:|---:|---|
-| Python unique-expert loop | 5 | 10.03 | 1.41 | baseline |
-| loop | 2 | 12.32 | 1.21 | |
-| loop | 1 | 11.69 | 1.10 | native indexer |
-| loop | 0 | 8.43 | 1.09 | AR floor |
-| **fused `exl3_moe`** | **2** | **23.74** | **0.45** | **default** |
-| fused | 5 | 19.83 | 0.56 | flattening |
-| fused | 1 | 20.65 | 0.45 | native indexer |
-| fused | 0 | 12.36 | 0.36 | AR |
-
-Fused k=2 is **2.37×** the loop-k=5 baseline and faster than the loop at every k.
-`EXL3_FUSED_MOE=0` restores the Python loop without a rebuild (~12 tok/s at k=2).
-
-CUDA graphs (`ENFORCE_EAGER=0`) fail at capture:
-`Cannot copy between CPU and CUDA tensors during CUDA graph capture` (host
-`argsort`/`bincount` on the fused apply path). Stay on `ENFORCE_EAGER=1`.
-
-Full receipts: [`docs/DECODE-SPEED-PLAN.md`](docs/DECODE-SPEED-PLAN.md) and
-`logs/decode-speed-YYYYMMDD/`.
-
-Coherence on the winner boot (temp 0): capital of France → **Paris**;
-**9.9 > 9.11**; a one-sentence sky-blue line. glm47 tools + glm45 reasoning stay
-on the launcher.
-
-## Stress tests
-
-Measured 2026-08-27 on this 2× GB10 kit, default serve (vision on, util **0.875**,
-MTP k=2, fused MoE, `ENFORCE_EAGER=1`, `MAX_NUM_BATCHED_TOKENS=1024`).
-`--chat-template /opt/glm53/chat_template.jinja` (checkpoint jinja is language-only).
-Thinking off is **top-level** JSON: `"chat_template_kwargs": {"enable_thinking": false}`
-(nested `extra_body` is ignored). API `:8888`.
-
-That boot: model load **82.36 GiB**, KV **2,004,630 tokens** / **17.36 GiB**
-`fp8_ds_mla`, `max_model_len` 1,048,576.
-
-| Test | What | Result |
-|---|---|---|
-| A Health + launch | `GET /health`; launch has `--chat-template`, `--limit-mm-per-prompt {"image":4,"video":1}`, `--skip-mm-profiling`, util 0.875, batched tokens 1024, **no** `--language-model-only` | **PASS** HTTP 200 |
-| B Image | `/home/mia/asus.jpg` as `data:image/jpeg;base64`, one-sentence describe, max_tokens 64 | **PASS** HTTP 200 in 26.4s, non-empty content |
-| C Video | 1s 256px mp4 (`ffmpeg -loop 1 -t 1 -i asus.jpg -vf scale=256:256`) as `data:video/mp4;base64`, one-sentence describe | **PASS** HTTP 200 in 9.0s, non-empty content. No `max_duration` 500, no 100-vs-300 placeholders, EngineCore stayed up. Health 200 after |
-| D ~300k prefill | user text ≈299700× `" the"` + short instruction, `max_tokens=8`, 1h timeout | **PASS** HTTP 200 in 340s. `prompt_tokens=299720`, `completion_tokens=8`. Health 200 after |
-
-Video used to die two ways: `Glm5NextVideoProcessor` has no `max_duration` (glm4v
-timestamp path), then a 1s clip built 3 timestamp blocks vs encoder `grid_t=1`
-(100 encoder tokens vs 300 placeholders). `overlay/patch_glm_video_placeholders.py`
-routes Glm5Next to glm46v timestamps and aligns block count to `grid_t`.
-
-Long-history decode used to die after a successful 300k prefill:
-`persistent_topk` oversubscribes GB10 smem (FilteredTopK wants ≥128 KiB, have
-101376; `total_ctas=124` > `num_sms*occupancy=48`, TopK=512). Chunk size 1024
-does not change that — it is decode over long KV, not prefill chunking. The same
-overlay forces `if False and current_platform.is_cuda()` in
-`sparse_attn_indexer_kpool.py` **before** `vllm` import so decode uses
-`top_k_per_row_decode`. Verified in both workers on the passing boot.
+**NVFP4 KV is not available here.** FlashInfer’s SM12x NVFP4 kernels are dense MHA,
+not sparse MLA. Do not confuse that with NVFP4 **weights** (`--moe-backend marlin`).
 
 ## Quick start (2× Spark)
 
@@ -195,6 +122,10 @@ curl -s http://127.0.0.1:8888/v1/chat/completions \
   }'
 ```
 
+Thinking off is **top-level** JSON: `"chat_template_kwargs": {"enable_thinking": false}`
+(nested `extra_body` is ignored). The launcher sets
+`--chat-template /opt/glm53/chat_template.jinja` (checkpoint jinja is language-only).
+
 Needs: Docker (no sudo) on both nodes, passwordless SSH head → worker,
 `docker login ghcr.io` on the head (private image), `hf` / `huggingface-cli` +
 `curl` + `rsync` on the head, ~180 GiB free per node for the first download.
@@ -217,8 +148,8 @@ your cabling differs. `ncclCommInitRank` hangs without them.
 | `PORT` | `8888` | OpenAI API on the head |
 | `TP` / `NNODES` | `2` / `2` | do not change for this recipe |
 | `QUANTIZATION` | `exl3` | overlay method; never `marlin` |
-| `MTP_TOKENS` | `2` | fused-path winner vs `{0,1,5}` |
-| `ENFORCE_EAGER` | `1` | graphs fail capture on fused apply |
+| `MTP_TOKENS` | `2` | speculative tokens |
+| `ENFORCE_EAGER` | `0` | CUDA graphs; start.sh adds capture sizes `1 2 3 4 6 8 12` |
 | `EXL3_FUSED_MOE` | `1` | `exl3_moe` per layer; `0` = LinearEXL3 loop |
 | `KV_CACHE_DTYPE` | `fp8` | packed `fp8_ds_mla`; not `nvfp4`, not bf16 |
 | `GPU_MEM_UTIL` | `0.875` | GB10 UMA budget |
@@ -255,7 +186,7 @@ this Dockerfile instead. After CUDA compile, Python overlay edits
 | `tests/bench_decode.py` | streaming decode + coherence probes against `:8888` |
 | `start.sh` / `stop.sh` | 2-node launch |
 | `files/chat_template.jinja` | GLM-5.3 MM template (`<|image|>` / `<|video|>`); checkpoint jinja is language-only |
-| `overlay/patch_glm_video_placeholders.py` | align video timestamp blocks to encoder `grid_t` (100 vs 300 crash) |
+| `overlay/patch_glm_video_placeholders.py` | align video timestamp blocks to encoder `grid_t` |
 
 Image-build runs `EXL3_SELFCHECK_GPU=0`. `./start.sh` runs the GPU self-check
 (`docker run --gpus all`) before shipping unless `SKIP_OVERLAY_VERIFY=1`.
