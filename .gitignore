@@ -1,0 +1,6 @@
+.env
+.glm53-exl3-*.inner.sh
+logs/
+__pycache__/
+*.py[cod]
+.pytest_cache/

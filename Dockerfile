@@ -1,7 +1,11 @@
-# GLM-5.3-Flash NoPE sparse MLA on SM120 (RTX PRO 6000 Blackwell).
+# GLM-5.3-Flash NoPE sparse MLA on SM121 (NVIDIA GB10 / DGX Spark).
 #
-# The stock image cannot serve this checkpoint on consumer Blackwell. GLM-5.3-Flash is
-# NoPE MLA (qk_rope_head_dim=0, d_qk=512), and on SM120 the only sparse-MLA backend is
+# EXL3 weights, not NVFP4: this overlay is the MLA/KV geometry, not the GEMM.
+# Do not pass --moe-backend marlin; that flag is the NVFP4 FLASHINFER_CUTLASS
+# workaround and is the wrong backend for an EXL3 checkpoint.
+#
+# The stock image cannot serve this checkpoint on GB10. GLM-5.3-Flash is
+# NoPE MLA (qk_rope_head_dim=0, d_qk=512), and on SM12x the only sparse-MLA backend is
 # FLASHINFER_MLA_SPARSE_SM120, whose impl mandates the packed fp8_ds_mla record. Two
 # things then reject it:
 #
@@ -74,10 +78,14 @@
 # drops exactly that tail. select_k stays 512, so the indexer keeps its fused top-k fast
 # path (sparse_attn_indexer_kpool.py:810 gates on select_k in {512,1024,2048}).
 #
-# Build (context = repo root):
-#   docker build -f patches/Dockerfile.glm53-flash-sm120 -t vllm-glm53-flash-sm120:local .
+# GB10 extras on top of the SM12x overlay: FlashInfer's sparse-MLA autotune and
+# fused_moe gemm1/gemm2 autotune kill rank 0 on SM121, and PDL lowering races
+# KDA state kernels here, so skip both and gate PDL to Hopper / SM10x.
+#
+# Build (context = repo root, aarch64 host):
+#   docker build -t glm53-flash-sm121:local .
 
-ARG BASE=vllm/vllm-openai:glm53-flash@sha256:2c6da6c6f16ed15c91e412d896dba13701f25fe1861eaec9ddaa4db34d1d21c4
+ARG BASE=vllm/vllm-openai:glm53-flash-arm64-cu130@sha256:905c02933be6021301db2dc284e24e3727467aa3a0f63b41d609885778a07bce
 FROM ${BASE}
 
 RUN python3 - <<'PY'
@@ -266,6 +274,47 @@ for old, new in (
         raise RuntimeError(f"expected one expand-pools target: {old!r}")
     text = text.replace(old, new)
 indexer.write_text(text)
+
+warmup = site / "model_executor/warmup/kernel_warmup.py"
+text = warmup.read_text()
+old_sparse_warmup = (
+    "    flashinfer_sparse_mla_decode_autotune_warmup(worker)\n"
+    "    deepseek_v4_sparse_mla_attention_warmup(worker)\n"
+)
+if text.count(old_sparse_warmup) != 1:
+    raise RuntimeError("expected one FlashInfer sparse-MLA warmup target")
+text = text.replace(
+    old_sparse_warmup,
+    "    # GLM53_SKIP_FI_SPARSE_WARMUP: SM120 autotune wedges rank 0 on GB10.\n"
+    "    deepseek_v4_sparse_mla_attention_warmup(worker)\n",
+)
+old_autotune = "    from flashinfer.autotuner import AutoTuner, set_autotune_process_group\n"
+if text.count(old_autotune) != 1:
+    raise RuntimeError("expected one FlashInfer autotuner import")
+text = text.replace(
+    old_autotune,
+    "    logger.info_once(\"Skipping FlashInfer autotune on SM121\")\n"
+    "    return\n"
+    "    from flashinfer.autotuner import AutoTuner, set_autotune_process_group\n",
+)
+warmup.write_text(text)
+
+platform = site / "platforms/cuda.py"
+text = platform.read_text()
+old_pdl = (
+    "            return False\n"
+    "        return major >= 9\n"
+)
+if text.count(old_pdl) != 1:
+    raise RuntimeError("expected one PDL capability gate")
+platform.write_text(
+    text.replace(
+        old_pdl,
+        "            return False\n"
+        "        # PDL lowering races KDA state kernels on SM12x (GB10).\n"
+        "        return major in (9, 10)\n",
+    )
+)
 PY
 
 RUN python3 - <<'PY'
@@ -309,5 +358,81 @@ align_src = (site / "platforms/cuda.py").read_text()
 compile(align_src, "cuda.py", "exec")
 assert "if capability is not None and capability.major == 12:" in align_src
 assert "return index_kpool * min(page_sizes)" in align_src
+assert "return major in (9, 10)" in align_src
+warmup_src = (site / "model_executor/warmup/kernel_warmup.py").read_text()
+compile(warmup_src, "kernel_warmup.py", "exec")
+assert "flashinfer_sparse_mla_decode_autotune_warmup(worker)" not in warmup_src
+assert "Skipping FlashInfer autotune on SM121" in warmup_src
 print("glm53 NoPE sparse-MLA overlay verify OK")
 PY
+
+# EXL3/MCG trellis for routed experts (compiled for SM121, not SM120 cubins).
+# Python overlay (exl3.py) is copied AFTER the CUDA compile so edits do not
+# rebuild exllamav3_ext. The aarch64 stub patch must stay in this layer.
+COPY overlay/patch_exl3_ext_aarch64.py /opt/glm53/patch_exl3_ext_aarch64.py
+
+ARG EXLLAMAV3_COMMIT=c5d9c657966ffeeaa9353f0cc899f18629da4a13
+ENV TORCH_CUDA_ARCH_LIST=12.1a
+ENV FLASHINFER_CUDA_ARCH_LIST=12.1a
+ENV MAX_JOBS=8
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=/usr/local/cuda/bin:${PATH}
+
+RUN python3 - <<'PY'
+from pathlib import Path
+
+init = Path("/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/__init__.py")
+text = init.read_text()
+old = 'QuantizationMethods = Literal[\n    "awq",\n'
+new = 'QuantizationMethods = Literal[\n    "exl3",\n    "awq",\n'
+if text.count(old) != 1:
+    raise RuntimeError("expected one QuantizationMethods Literal header")
+text = text.replace(old, new)
+lazy = (
+    "    # Update the `method_to_config` with customized quantization methods.\n"
+    "    method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)\n"
+    "\n"
+    "    return method_to_config[quantization]\n"
+)
+lazy_new = (
+    "    from .exl3 import Exl3Config\n"
+    "    method_to_config[\"exl3\"] = Exl3Config\n"
+    "    # Update the `method_to_config` with customized quantization methods.\n"
+    "    method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)\n"
+    "\n"
+    "    return method_to_config[quantization]\n"
+)
+if text.count(lazy) != 1:
+    raise RuntimeError("expected one get_quantization_config trailer")
+text = text.replace(lazy, lazy_new)
+init.write_text(text)
+print("registered exl3 in QUANTIZATION_METHODS (lazy import)")
+PY
+
+# The vLLM image keeps CUDA toolkit headers under nvidia/cu13 (cusparse.h), not
+# /usr/local/cuda/include. ExLlamaV3 also ships AVX2/AVX512 CPU targets that
+# do not compile on aarch64; stub them so the SM121 GEMM still builds.
+RUN set -eux; \
+    mkdir -p /tmp/exllamav3; \
+    curl -fsSL "https://github.com/turboderp-org/exllamav3/archive/${EXLLAMAV3_COMMIT}.tar.gz" \
+      | tar -xz -C /tmp/exllamav3 --strip-components=1; \
+    python3 -c "from pathlib import Path; assert (Path('/tmp/exllamav3')/'exllamav3/modules/quant/exl3.py').is_file()"; \
+    python3 /opt/glm53/patch_exl3_ext_aarch64.py /tmp/exllamav3/exllamav3/exllamav3_ext; \
+    export CPATH="/usr/local/lib/python3.12/dist-packages/nvidia/cu13/include${CPATH:+:$CPATH}"; \
+    export CPLUS_INCLUDE_PATH="/usr/local/lib/python3.12/dist-packages/nvidia/cu13/include${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"; \
+    export C_INCLUDE_PATH="/usr/local/lib/python3.12/dist-packages/nvidia/cu13/include${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"; \
+    cd /tmp/exllamav3; \
+    TORCH_CUDA_ARCH_LIST=12.1a MAX_JOBS=8 \
+      pip install --no-deps --no-build-isolation --no-cache-dir .; \
+    python3 -c "import torch; import exllamav3_ext; assert hasattr(exllamav3_ext, 'exl3_moe'), dir(exllamav3_ext); print('exllamav3_ext', exllamav3_ext.__file__, 'exl3_moe=yes')"; \
+    rm -rf /tmp/exllamav3 /root/.cache/pip
+
+# Keep this AFTER the CUDA compile layer so Python-only hook edits do not
+# rebuild exllamav3_ext. Exl3Config.override_quantization_method requires
+# "exl3" in ModelConfig's ordered overrides list.
+COPY overlay/exl3.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/exl3.py
+COPY overlay/patch_model_overrides.py /opt/glm53/patch_model_overrides.py
+COPY tests/test_exl3_overlay.py /opt/glm53/test_exl3_overlay.py
+RUN python3 /opt/glm53/patch_model_overrides.py
+
+RUN EXL3_SELFCHECK_GPU=0 python3 /opt/glm53/test_exl3_overlay.py

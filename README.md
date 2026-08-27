@@ -1,73 +1,214 @@
-# glm-5.3-flash-sm120
+# GLM-5.3-Flash EXL3 on GB10 (SM121 / DGX Spark)
 
-[zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) on consumer
-Blackwell (SM120). The stock `vllm/vllm-openai:glm53-flash` image loads the weights and
-then dies on the first forward with `pe_dim must be 64 for fp8_ds_mla`, because this
-checkpoint is NoPE MLA and SM120's only sparse-MLA kernel expects a 64-wide RoPE block.
-This is a single-layer overlay on that image which makes it run.
+OpenAI-compatible vLLM serve of
+[zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) as
+**[brandonmusic/GLM-5.3-Flash-EXL3-4bpw](https://huggingface.co/brandonmusic/GLM-5.3-Flash-EXL3-4bpw)**
+(routed-experts-only EXL3/MCG trellis, 4 bpw, ~164 GiB, 120 shards) on a **2× NVIDIA GB10**
+kit: tensor-parallel size 2 over CX7, native `sm_121a` cubins, API on `:8888`.
 
-Image:
+This is **EXL3 weights + fp8 KV**, not NVFP4. Do not pass `--moe-backend marlin`.
+Do not use the amd64 SM120 image `cstechdev/vllm:glm53-flash-nope-sm120-*`.
 
-```
-cstechdev/vllm:glm53-flash-nope-sm120-cu130-20260826-r1
-```
+Measured on this kit (fused MoE, MTP k=2, enforce-eager): **~24 tok/s decode**
+(3-run median) vs **~10 tok/s** on the old unique-expert Python loop at MTP k=5.
+KV pool **2,051,954 tokens** at `gpu-memory-utilization 0.87` (fused MTP k=2).
 
-Verified on 4x RTX PRO 6000 Blackwell (96 GB, capability 12.0), CUDA 13.0.
+## What runs
 
-## Run
+| Layer | Runtime |
+|---|---|
+| API | vLLM OpenAI (`/v1/chat/completions`) on the head, port **8888** |
+| Model id | `brandonmusic/GLM-5.3-Flash-EXL3-4bpw` |
+| Image | `glm53-flash-sm121:local` FROM `vllm/vllm-openai:glm53-flash-arm64-cu130@sha256:905c0293…` (arm64, CUDA 13.0) |
+| Executor | `mp`, `--nnodes 2`, `--tensor-parallel-size 2` |
+| Head | this machine, `HEAD_IP=10.0.0.1`, container `glm53-exl3-head` |
+| Worker | `WORKER_USER@WORKER_IP` (this kit: `zurih@10.0.0.2`), `--headless`, `glm53-exl3-worker` |
+| Fabric | CX7 QSFP: `enp1s0f1np1`/`rocep1s0f1` ↔ `enp1s0f0np0`/`rocep1s0f0`. Image NCCL (`USE_HOST_NCCL=0`) |
+| Attention | `FLASHINFER_MLA_SPARSE_SM120` (NoPE MLA padded into GLM_NSA 576-wide) |
+| KV | `--kv-cache-dtype fp8` → packed **`fp8_ds_mla`**, 656 B/token MLA record |
+| Experts | packed trellis + suh + svh + mcg, codebook MCG, **one fused `exllamav3_ext.exl3_moe` launch per layer** |
+| Dense / shared / attn / embed / lm_head | native (unquantized) |
+| Spec | MTP, default **`MTP_TOKENS=2`** (measured winner) |
+| Tools / reasoning | `--tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm45` |
+| Graphs | off (`ENFORCE_EAGER=1`) — capture hits a CPU↔CUDA copy in fused apply |
+| Vision | off (`LANGUAGE_MODEL_ONLY=1`) |
+
+Kernels: `TORCH_CUDA_ARCH_LIST=12.1a`. ExLlamaV3 pin `c5d9c657` (0.0.43) exposes
+`exl3_moe` / `exl3_moe_max_concurrency`; aarch64 CPU allreduce stubs in
+`overlay/patch_exl3_ext_aarch64.py`.
+
+## Why the overlay exists
+
+Stock `vllm/vllm-openai:glm53-flash-arm64-cu130` loads this checkpoint and dies on
+the first forward: `pe_dim must be 64 for fp8_ds_mla`. GLM-5.3-Flash is **NoPE MLA**
+(`qk_rope_head_dim=0`, `kv_lora_rank=512`). On SM12x the only sparse-MLA backend is
+`FLASHINFER_MLA_SPARSE_SM120`, whose packed record is 512 NoPE + 16 B scales + 128 B
+RoPE (656 B). The overlay zero-pads the 512-d latent into that GLM_NSA geometry
+(RoPE pad is zeros; the QK dot is unchanged) and registers a real EXL3 method so
+routed experts stay packed instead of expanding to BF16.
+
+Registering the name `"exl3"` is not enough. Experts must stay **trellis + suh +
+svh + mcg** and run Trellis/MCG. Shared experts, attention, embeddings, and
+`lm_head` stay native. TP=2 shards gate/up **column-wise** and down **row-wise**;
+the MoE runner all-reduces once per layer.
+
+## KV cache
+
+`--kv-cache-dtype fp8` is required. The SM12x sparse-MLA kernel only accepts packed
+`fp8_ds_mla`. **bf16 KV has no sparse kernel** on this arch.
+
+| MTP k | MoE | KV tokens (util 0.85, this kit) | Indexer |
+|---:|---|---:|---|
+| 5 | fused | 1,564,672 | flattening, `next_n=6` |
+| **2 (default)** | **fused** | **2,051,954** at util **0.87** (1,768,718 at 0.85) | flattening, `next_n=3` |
+| 1 | fused | 1,785,075 | native DeepGEMM, `next_n=2` |
+| 0 | fused | **2,326,528** | native, `next_n=1` |
+
+MLA KV is **~8.7 KiB/token** once indexer + KDA page alignment are included
+(656 B record is only the MLA slab). Default is **`GPU_MEM_UTIL=0.87`**: this boot
+allocated **19.77 GiB** KV (2,051,954 tokens). That is **~1.96×** a native 1M
+request (`MAX_MODEL_LEN=1048576`) or 7.83× at 262k. At 0.85 it was ~1.77M tokens.
+Weights + non-torch still ~83 GiB of 121 GiB UMA.
+
+**NVFP4 KV is not available here.** `FLASHINFER_MLA_SPARSE_SM120` only lists
+`auto` / `fp8` / `fp8_e4m3` / `fp8_ds_mla`. FlashInfer’s SM12x NVFP4 attention
+kernels are **dense MHA** (XQA/FA2), not sparse MLA. Adding `nvfp4` to the Python
+dtype list will fail backend selection or `concat_and_cache_mla`. A real NVFP4
+sparse-MLA cache would need new SM121 kernels plus a new packed write path — not
+an `.env` flag. Do not confuse that with NVFP4 **weights** (`--moe-backend marlin`).
+
+## Decode speed (this kit)
+
+Protocol: thinking off, temp 0, 200 tokens, 3 streaming runs, median.
+Prompt: hash-map explanation (see `tests/bench_decode.py`). Decode tok/s =
+`(completion_tokens - 1) / (end - first_token_time)`.
+
+| MoE | MTP k | tok/s med | TTFT med (s) | Keep |
+|---|---:|---:|---:|---|
+| Python unique-expert loop | 5 | 10.03 | 1.41 | baseline |
+| loop | 2 | 12.32 | 1.21 | |
+| loop | 1 | 11.69 | 1.10 | native indexer |
+| loop | 0 | 8.43 | 1.09 | AR floor |
+| **fused `exl3_moe`** | **2** | **23.74** | **0.45** | **default** |
+| fused | 5 | 19.83 | 0.56 | flattening |
+| fused | 1 | 20.65 | 0.45 | native indexer |
+| fused | 0 | 12.36 | 0.36 | AR |
+
+Fused k=2 is **2.37×** the loop-k=5 baseline and faster than the loop at every k.
+`EXL3_FUSED_MOE=0` restores the Python loop without a rebuild (~12 tok/s at k=2).
+
+CUDA graphs (`ENFORCE_EAGER=0`) fail at capture:
+`Cannot copy between CPU and CUDA tensors during CUDA graph capture` (host
+`argsort`/`bincount` on the fused apply path). Stay on `ENFORCE_EAGER=1`.
+
+Full receipts: [`docs/DECODE-SPEED-PLAN.md`](docs/DECODE-SPEED-PLAN.md) and
+`logs/decode-speed-YYYYMMDD/`.
+
+Coherence on the winner boot (temp 0): capital of France → **Paris**;
+**9.9 > 9.11**; a one-sentence sky-blue line. glm47 tools + glm45 reasoning stay
+on the launcher.
+
+## Quick start (2× Spark)
 
 ```bash
-docker run -d --name vllm-glm53-flash \
-  --restart unless-stopped --init --gpus all --ipc=host --shm-size 32g \
-  -p 8001:8001 \
-  -e VLLM_ENGINE_READY_TIMEOUT_S=3600 \
-  -v "$MODEL_DIR":/model:ro \
-  -v "$HOME/.cache/vllm-glm53-flash":/root/.cache \
-  cstechdev/vllm:glm53-flash-nope-sm120-cu130-20260826-r1 \
-  /model \
-  --served-model-name GLM-5.3-Flash \
-  --host 0.0.0.0 --port 8001 \
-  --tensor-parallel-size 4 \
-  --max-num-seqs 10 \
-  --max-model-len 524288 \
-  --max-num-batched-tokens 8192 \
-  --gpu-memory-utilization 0.95 \
-  --kv-cache-dtype fp8 \
-  --enable-prefix-caching \
-  --no-enable-flashinfer-autotune \
-  --enable-auto-tool-choice \
-  --tool-call-parser glm47 \
-  --reasoning-parser glm45 \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":5}'
+cp .env.example .env          # edit HEAD_IP / WORKER_IP / WORKER_USER if needed
+./start.sh                    # build image, download EXL3, rsync, launch TP=2
 ```
 
-`MODEL_DIR` is a local checkout of the checkpoint (62 shards, ~306 GiB); add
-`-e HF_HUB_OFFLINE=1` when serving from it. To pull from the Hub instead, drop the
-`-v "$MODEL_DIR"` line, pass `zai-org/GLM-5.3-Flash` in place of `/model`, and mount
-`-v "$HOME/.cache/huggingface":/root/.cache/huggingface`.
+First run of `./start.sh` copies `.env.example` → `.env` if missing. Prefix env
+wins over `.env` (`MTP_TOKENS=1 SKIP_DOWNLOAD=1 ./start.sh restart`).
 
-`serve.sh` is the same command with env-overridable knobs (`MAX_MODEL_LEN`, `SPEC_TOKENS`,
-`PORT`, ...).
+`./start.sh` will:
 
-First boot takes ~72 s to load weights plus ~200 s of torch.compile and Triton JIT; the
-`/root/.cache` mount keeps later boots short.
-
-## Notes
-
-- `--kv-cache-dtype fp8` is mandatory. The SM120 sparse-MLA path only accepts the packed
-  `fp8_ds_mla` layout; bf16 KV has no kernel on this arch.
-- `--max-num-seqs 10` pairs with 5 speculative tokens: decode batches over 64 tokens fall
-  off FlashInfer's specialized decode kernel, and `10 x (5 + 1) = 60`.
-- Context costs ~8.7 KiB/token of KV. 1M context does not fit alongside
-  `num_speculative_tokens: 5` — use 1 or 0 for that.
-- The command above is the verified configuration: 609,172 tokens of KV (1.16x concurrency
-  at full context), engine init 185 s, MTP mean acceptance length 2.5-5.1 depending on
-  workload (avg draft acceptance 29-82%).
-
-## Build
+1. Preflight docker/ssh/disk on both nodes
+2. Build `glm53-flash-sm121:local` if missing; `docker save | ssh docker load` onto the worker (or whenever head/worker image Ids differ)
+3. Download the EXL3 repo into `$HF_HOME` / `~/.cache/huggingface` (~164 GiB, 120 shards)
+4. `rsync` that cache to `${WORKER_HOME}/.cache/huggingface`
+5. Start rank 1 `--headless` on the worker, rank 0 + API on the head
+6. Poll `/health` (weight load + warmup is slow; `READY_TIMEOUT` default 3600s)
 
 ```bash
-docker build -t glm53-flash-sm120:local .
+SKIP_DOWNLOAD=1 SKIP_SYNC=1 ./start.sh     # weights already local on both nodes
+PULL=1 SKIP_DOWNLOAD=1 SKIP_SYNC=1 ./start.sh restart   # rebuild overlay + ship
+./start.sh status
+./start.sh logs                # head
+./start.sh logs worker
+./start.sh stop                # or ./stop.sh
 ```
 
-The `Dockerfile` pins the base by digest and documents each change inline.
+API: `http://127.0.0.1:8888/v1` (LAN: `http://10.0.0.1:8888/v1`).
+
+```bash
+curl -s http://127.0.0.1:8888/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "brandonmusic/GLM-5.3-Flash-EXL3-4bpw",
+    "messages": [{"role": "user", "content": "hello!"}]
+  }'
+```
+
+Needs: Docker (no sudo) on both nodes, passwordless SSH head → worker,
+`hf` / `huggingface-cli` + `curl` + `rsync` on the head, ~180 GiB free per node
+for the first download. Mixed OS accounts: set `WORKER_USER` (this kit uses
+`zurih` on spark2).
+
+NCCL cannot use the `10.0.0.x` loopback aliases — leave the CX7 pins unless
+your cabling differs. `ncclCommInitRank` hangs without them.
+
+## .env
+
+| Knob | Default | What |
+|---|---|---|
+| `HEAD_IP` | `10.0.0.1` | this node, NCCL/vLLM master |
+| `WORKER_IP` | `10.0.0.2` | other Spark |
+| `WORKER_USER` | *(unset = `$USER`)* | SSH user on the worker |
+| `WORKER_HOME` | `$HOME` if same user, else `/home/$WORKER_USER` | worker HF cache |
+| `MODEL` | `brandonmusic/GLM-5.3-Flash-EXL3-4bpw` | Hub repo into the HF cache |
+| `IMAGE` | `glm53-flash-sm121:local` | serve image |
+| `PORT` | `8888` | OpenAI API on the head |
+| `TP` / `NNODES` | `2` / `2` | do not change for this recipe |
+| `QUANTIZATION` | `exl3` | overlay method; never `marlin` |
+| `MTP_TOKENS` | `2` | fused-path winner vs `{0,1,5}` |
+| `ENFORCE_EAGER` | `1` | graphs fail capture on fused apply |
+| `EXL3_FUSED_MOE` | `1` | `exl3_moe` per layer; `0` = LinearEXL3 loop |
+| `KV_CACHE_DTYPE` | `fp8` | packed `fp8_ds_mla`; not `nvfp4`, not bf16 |
+| `GPU_MEM_UTIL` | `0.87` | GB10 UMA budget |
+| `MAX_MODEL_LEN` | `1048576` | native `text_config.max_position_embeddings`; KV at util 0.87 holds ~2.0× 1M |
+| `MAX_NUM_SEQS` | `4` | decode batch; MTP adds k+1 tokens/seq |
+| `LANGUAGE_MODEL_ONLY` | `1` | no vision tower |
+| `HEAD_CX7_IF` / `WORKER_CX7_IF` | `enp1s0f1np1` / `enp1s0f0np0` | NCCL sockets |
+| `HEAD_CX7_IB` / `WORKER_CX7_IB` | `rocep1s0f1` / `rocep1s0f0` | NCCL HCAs |
+| `USE_HOST_NCCL` | `0` | image nvidia-nccl; host preload duplicates DeepEP |
+
+## Image / overlay
+
+```bash
+docker build -t glm53-flash-sm121:local .
+```
+
+`./start.sh` builds this if the tag is missing. After CUDA compile, Python overlay
+edits (`overlay/exl3.py`, tests) are a cheap layer so they do not rebuild
+`exllamav3_ext`.
+
+| Path | Role |
+|---|---|
+| `Dockerfile` | NoPE sparse-MLA patches + EXL3 install (`sm_121a`) + self-check |
+| `overlay/exl3.py` | `Exl3Config` / packed load / TP shard / fused `exl3_moe` apply |
+| `overlay/patch_exl3_ext_aarch64.py` | stub AVX CPU allreduce so the ext builds on GB10 |
+| `overlay/patch_model_overrides.py` | `"exl3"` in ModelConfig overrides |
+| `tests/test_exl3_overlay.py` | registry, TP shard, `sm_121a` cubin, fused vs loop GEMM, `EXL3_FUSED_MOE=0` |
+| `tests/bench_decode.py` | streaming decode + coherence probes against `:8888` |
+| `start.sh` / `stop.sh` | 2-node launch |
+| `serve.sh` | single-container helper (no download, no worker sync) |
+
+Image-build runs `EXL3_SELFCHECK_GPU=0`. `./start.sh` runs the GPU self-check
+(`docker run --gpus all`) before shipping unless `SKIP_OVERLAY_VERIFY=1`.
+
+## Do not
+
+- Destroy HF weights, requantize, `REFRESH_WEIGHTS=1`, or `docker rm` HF caches
+- `--moe-backend marlin`, NVFP4 weights, or `glm53-flash-sm121:v8` as this serve
+- qemu / amd64 / `cstechdev/vllm:glm53-flash-nope-sm120-*`
+- `--kv-cache-dtype nvfp4` or bf16 (no sparse-MLA kernel)
+- Change TP, CX7 pins, or `USE_HOST_NCCL` unless you are re-plumbing NCCL
+- Force-push
