@@ -214,16 +214,11 @@ preflight() {
     [ "$NNODES" = "2" ] || warn "NNODES=${NNODES} — expected 2"
 
     local others
-    others=$(docker ps --format '  {{.Names}}  ({{.Image}})' | grep -v "^  ${CONTAINER_HEAD}" || true)
-    if [ -n "$others" ]; then
-        warn "other containers are running on the head:"
-        echo "$others" >&2
-        warn "this model needs most of each GB10 — stop GPU containers first"
-    fi
     others=$(worker_ssh "docker ps --format '  {{.Names}}  ({{.Image}})'" 2>/dev/null | grep -v "^  ${CONTAINER_WORKER}" || true)
     if [ -n "$others" ]; then
         warn "other containers are running on the worker:"
         echo "$others" >&2
+        warn "this model needs most of each GB10 — stop GPU containers on the worker first"
     fi
 
     check_port_free "$PORT" PORT
