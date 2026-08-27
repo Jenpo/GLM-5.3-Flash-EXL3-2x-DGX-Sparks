@@ -145,9 +145,10 @@ warn() { printf '\033[1;33m[glm53-exl3]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[glm53-exl3]\033[0m ERROR: %s\n' "$*" >&2; exit 1; }
 
 banner() {
+    local label="${1:-start.sh}"
     printf '\n'
     printf '  \033[1;36m┌─────────────────────────────────────────┐\033[0m\n'
-    printf '  \033[1;36m│\033[0m  \033[1mMia'\''s GLM-5.3 Flash\033[0m  \033[2m·  start.sh\033[0m       \033[1;36m│\033[0m\n'
+    printf '  \033[1;36m│\033[0m  \033[1mMia'\''s GLM-5.3 Flash\033[0m  \033[2m·  %s\033[0m       \033[1;36m│\033[0m\n' "$label"
     printf '  \033[1;36m└─────────────────────────────────────────┘\033[0m\n'
     printf '\n'
 }
@@ -706,7 +707,11 @@ logs() {
 # ------------------------------- main --------------------------------------
 main() {
     local cmd="${1:-start}"
-    banner
+    if [ "$cmd" = stop ]; then
+        banner stop.sh
+    else
+        banner start.sh
+    fi
     case "$cmd" in
         start)   shift || true; start ;;
         stop)    stop ;;
