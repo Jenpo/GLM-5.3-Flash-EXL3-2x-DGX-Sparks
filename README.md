@@ -223,7 +223,6 @@ this Dockerfile instead. After CUDA compile, Python overlay edits
 | `tests/test_exl3_overlay.py` | registry, TP shard, `sm_121a` cubin, fused vs loop GEMM, `EXL3_FUSED_MOE=0` |
 | `tests/bench_decode.py` | streaming decode + coherence probes against `:8888` |
 | `start.sh` / `stop.sh` | 2-node launch |
-| `serve.sh` | single-container helper (no download, no worker sync) |
 
 Image-build runs `EXL3_SELFCHECK_GPU=0`. `./start.sh` runs the GPU self-check
 (`docker run --gpus all`) before shipping unless `SKIP_OVERLAY_VERIFY=1`.

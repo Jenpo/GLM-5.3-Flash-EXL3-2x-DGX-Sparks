@@ -67,7 +67,7 @@ GLM-5.3-Flash routes **8 of 288** experts per token. MTP-5 then asks for
 
 - fused multi-step MTP draft is unsupported on `FLASHINFER_MLA_SPARSE_SM120`
 - DeepGEMM fp8 paged MQA only serves indexer `next_n ∈ {1, 2}`
-- k=5 therefore uses the flattening fallback (`serve.sh` already documents this)
+- k=5 therefore uses the flattening fallback (`start.sh` already documents this)
 
 So k=5 is not “MTP-4 fused”. It is sequential/flattened speculation on top of
 an already Python-bound MoE.
