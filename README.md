@@ -117,6 +117,37 @@ Coherence on the winner boot (temp 0): capital of France → **Paris**;
 **9.9 > 9.11**; a one-sentence sky-blue line. glm47 tools + glm45 reasoning stay
 on the launcher.
 
+## Stress tests
+
+Measured 2026-08-27 on this 2× GB10 kit, default serve (vision on, util **0.875**,
+MTP k=2, fused MoE, `ENFORCE_EAGER=1`, `MAX_NUM_BATCHED_TOKENS=1024`).
+`--chat-template /opt/glm53/chat_template.jinja` (checkpoint jinja is language-only).
+Thinking off is **top-level** JSON: `"chat_template_kwargs": {"enable_thinking": false}`
+(nested `extra_body` is ignored). API `:8888`.
+
+That boot: model load **82.36 GiB**, KV **2,004,630 tokens** / **17.36 GiB**
+`fp8_ds_mla`, `max_model_len` 1,048,576.
+
+| Test | What | Result |
+|---|---|---|
+| A Health + launch | `GET /health`; launch has `--chat-template`, `--limit-mm-per-prompt {"image":4,"video":1}`, `--skip-mm-profiling`, util 0.875, batched tokens 1024, **no** `--language-model-only` | **PASS** HTTP 200 |
+| B Image | `/home/mia/asus.jpg` as `data:image/jpeg;base64`, one-sentence describe, max_tokens 64 | **PASS** HTTP 200 in 26.4s, non-empty content |
+| C Video | 1s 256px mp4 (`ffmpeg -loop 1 -t 1 -i asus.jpg -vf scale=256:256`) as `data:video/mp4;base64`, one-sentence describe | **PASS** HTTP 200 in 9.0s, non-empty content. No `max_duration` 500, no 100-vs-300 placeholders, EngineCore stayed up. Health 200 after |
+| D ~300k prefill | user text ≈299700× `" the"` + short instruction, `max_tokens=8`, 1h timeout | **PASS** HTTP 200 in 340s. `prompt_tokens=299720`, `completion_tokens=8`. Health 200 after |
+
+Video used to die two ways: `Glm5NextVideoProcessor` has no `max_duration` (glm4v
+timestamp path), then a 1s clip built 3 timestamp blocks vs encoder `grid_t=1`
+(100 encoder tokens vs 300 placeholders). `overlay/patch_glm_video_placeholders.py`
+routes Glm5Next to glm46v timestamps and aligns block count to `grid_t`.
+
+Long-history decode used to die after a successful 300k prefill:
+`persistent_topk` oversubscribes GB10 smem (FilteredTopK wants ≥128 KiB, have
+101376; `total_ctas=124` > `num_sms*occupancy=48`, TopK=512). Chunk size 1024
+does not change that — it is decode over long KV, not prefill chunking. The same
+overlay forces `if False and current_platform.is_cuda()` in
+`sparse_attn_indexer_kpool.py` **before** `vllm` import so decode uses
+`top_k_per_row_decode`. Verified in both workers on the passing boot.
+
 ## Quick start (2× Spark)
 
 ```bash
