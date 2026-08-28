@@ -2,7 +2,6 @@
 .glm53-exl3-*.inner.sh
 logs/
 tool-eval-bench/
-# Local ABLIT overlay lives on the `ablit` branch.
 ablit/
 __pycache__/
 *.py[cod]
