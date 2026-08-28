@@ -142,6 +142,7 @@ MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-1024}"
 CHAT_TEMPLATE_HOST="${CHAT_TEMPLATE_HOST:-$SCRIPT_DIR/files/chat_template.jinja}"
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-/opt/glm53/chat_template.jinja}"
 VIDEO_PATCH_HOST="${VIDEO_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_glm_video_placeholders.py}"
+STOP_PATCH_HOST="${STOP_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_suppress_stops_in_reasoning.py}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 QUANTIZATION="${QUANTIZATION:-exl3}"
 LANGUAGE_MODEL_ONLY="${LANGUAGE_MODEL_ONLY:-0}"
@@ -183,6 +184,8 @@ ABLIT_ALPHA="${ABLIT_ALPHA:-3.0}"              # 1.0 = plain projection, >1 over
 ABLIT_INCLUDE_MTP="${ABLIT_INCLUDE_MTP:-1}"
 
 READY_TIMEOUT="${READY_TIMEOUT:-3600}"
+# 1 = suppress client stop strings until </think> (DSpark #42 class).
+GLM53_SUPPRESS_STOPS_IN_REASONING="${GLM53_SUPPRESS_STOPS_IN_REASONING:-1}"
 
 CONTAINER_HEAD="${CONTAINER_HEAD:-glm53-exl3-head}"
 CONTAINER_WORKER="${CONTAINER_WORKER:-glm53-exl3-worker}"
@@ -311,6 +314,7 @@ preflight() {
     [ -f "$SCRIPT_DIR/ablit/refusal_direction_glm53_bf_oproj.pt" ] || die "$SCRIPT_DIR/ablit/refusal_direction_glm53_bf_oproj.pt missing"
     [ -f "$SCRIPT_DIR/overlay/ablit_runtime.py" ] || die "$SCRIPT_DIR/overlay/ablit_runtime.py missing"
     [ -f "$SCRIPT_DIR/overlay/patch_ablit.py" ] || die "$SCRIPT_DIR/overlay/patch_ablit.py missing"
+    [ -f "$STOP_PATCH_HOST" ] || die "$STOP_PATCH_HOST missing"
     if [ "$ABLIT" = "1" ]; then
         log "ablit: ON (direction=${ABLIT_DIRECTION} layers=${ABLIT_LAYERS} alpha=${ABLIT_ALPHA} mtp=${ABLIT_INCLUDE_MTP})"
     fi
@@ -629,6 +633,9 @@ fi
 if [ -f /opt/glm53/patch_ablit.py ]; then
     python3 /opt/glm53/patch_ablit.py
 fi
+if [ -f /opt/glm53/patch_suppress_stops_in_reasoning.py ]; then
+    python3 /opt/glm53/patch_suppress_stops_in_reasoning.py
+fi
 if [ "${ABLIT:-0}" = "1" ]; then
     say "ablit: o_proj orthogonalization ON (direction=${ABLIT_DIRECTION:-dealign} layers=${ABLIT_LAYERS:-15-45} alpha=${ABLIT_ALPHA:-3.0})"
 else
@@ -701,6 +708,9 @@ fi
 if [ -f /opt/glm53/patch_ablit.py ]; then
     python3 /opt/glm53/patch_ablit.py
 fi
+if [ -f /opt/glm53/patch_suppress_stops_in_reasoning.py ]; then
+    python3 /opt/glm53/patch_suppress_stops_in_reasoning.py
+fi
 if [ "${ABLIT:-0}" = "1" ]; then
     say "ablit: o_proj orthogonalization ON (direction=${ABLIT_DIRECTION:-dealign} layers=${ABLIT_LAYERS:-15-45} alpha=${ABLIT_ALPHA:-3.0})"
 else
@@ -724,6 +734,8 @@ launch_cluster() {
     scp -q -o BatchMode=yes "$CHAT_TEMPLATE_HOST" "${WORKER_SSH}:/tmp/glm53-chat_template.jinja"
     [ -f "$VIDEO_PATCH_HOST" ] || die "missing $VIDEO_PATCH_HOST"
     scp -q -o BatchMode=yes "$VIDEO_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_glm_video_placeholders.py"
+    [ -f "$STOP_PATCH_HOST" ] || die "missing $STOP_PATCH_HOST"
+    scp -q -o BatchMode=yes "$STOP_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_suppress_stops_in_reasoning.py"
 
     # ablit artifacts + hook (read-only mounts inside both containers)
     worker_ssh "rm -rf /tmp/glm53-ablit"
@@ -747,6 +759,7 @@ launch_cluster() {
         -e TRANSFORMERS_OFFLINE=1
         -e HF_HOME=/root/.cache/huggingface
         -e VLLM_CACHE_ROOT=/root/.cache/vllm
+        -e "GLM53_SUPPRESS_STOPS_IN_REASONING=$GLM53_SUPPRESS_STOPS_IN_REASONING"
         -e "TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST"
         -e "FLASHINFER_CUDA_ARCH_LIST=$FLASHINFER_CUDA_ARCH_LIST"
         -e FLASHINFER_DISABLE_VERSION_CHECK=1
@@ -801,6 +814,7 @@ launch_cluster() {
         -v '/tmp/${CONTAINER_WORKER}.sh:/start.sh:ro' \
         -v '/tmp/glm53-chat_template.jinja:${CHAT_TEMPLATE}:ro' \
         -v '/tmp/patch_glm_video_placeholders.py:/opt/glm53/patch_glm_video_placeholders.py:ro' \
+        -v '/tmp/patch_suppress_stops_in_reasoning.py:/opt/glm53/patch_suppress_stops_in_reasoning.py:ro' \
         -v '/tmp/glm53-ablit:/opt/glm53/ablit:ro' \
         -v '/tmp/glm53-ablit_runtime.py:/opt/glm53/ablit_runtime.py:ro' \
         -v '/tmp/patch_ablit.py:/opt/glm53/patch_ablit.py:ro' \
@@ -823,6 +837,7 @@ launch_cluster() {
         -v "$HEAD_SCRIPT:/start.sh:ro" \
         -v "$CHAT_TEMPLATE_HOST:$CHAT_TEMPLATE:ro" \
         -v "$VIDEO_PATCH_HOST:/opt/glm53/patch_glm_video_placeholders.py:ro" \
+        -v "$STOP_PATCH_HOST:/opt/glm53/patch_suppress_stops_in_reasoning.py:ro" \
         -v "$SCRIPT_DIR/ablit:/opt/glm53/ablit:ro" \
         -v "$SCRIPT_DIR/overlay/ablit_runtime.py:/opt/glm53/ablit_runtime.py:ro" \
         -v "$SCRIPT_DIR/overlay/patch_ablit.py:/opt/glm53/patch_ablit.py:ro" \

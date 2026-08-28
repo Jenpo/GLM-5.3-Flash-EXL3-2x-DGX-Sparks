@@ -336,6 +336,7 @@ your cabling differs. `ncclCommInitRank` hangs without them.
 | `MAX_MODEL_LEN` | `900000` | default context. The 982,612-token pool is **1.09×** a full 900k request. Native 1M does not allocate |
 | `MAX_NUM_SEQS` | `4` | decode batch; MTP adds k+1 tokens/seq |
 | `MAX_NUM_BATCHED_TOKENS` | `1024` | prefill chunk; 8192 oversubscribes GB10 indexer topk on long context |
+| `GLM53_SUPPRESS_STOPS_IN_REASONING` | `1` | ignore client `stop` strings until `</think>` (thinking-on default) |
 | `LANGUAGE_MODEL_ONLY` | `0` | load vision tower (image + video) |
 | `SKIP_MM_PROFILING` | `1` | skip max-size MM dummy at init (OOM otherwise) |
 | `LIMIT_MM` | `{"image":4,"video":1}` | `--limit-mm-per-prompt` |
@@ -374,6 +375,7 @@ this Dockerfile instead. After CUDA compile, Python overlay edits
 | `overlay/patch_glm_video_placeholders.py` | align video timestamp blocks to encoder `grid_t` |
 | `overlay/ablit_runtime.py` | ABLIT: o_proj refusal-direction orthogonalization at load (`ABLIT=1`) |
 | `overlay/patch_ablit.py` | install the ABLIT hook into `Glm5NextModel` / `Glm5NextMTP` load (idempotent) |
+| `overlay/patch_suppress_stops_in_reasoning.py` | fail-closed detokenizer guard: client `stop` dormant until `</think>` |
 | `ablit/` | direction vectors + `LAYER_MAP.json` from drowzeys' published ablit recipe |
 | `tests/test_ablit.py` | recipe integrity, orthogonalization math, TP-shard equivalence, hook gating |
 
