@@ -444,13 +444,17 @@ COPY overlay/patch_suppress_stops_in_reasoning.py /opt/glm53/patch_suppress_stop
 COPY tests/test_suppress_stops.py /opt/glm53/test_suppress_stops.py
 COPY overlay/patch_scheduler_decode_floor.py /opt/glm53/patch_scheduler_decode_floor.py
 COPY tests/test_scheduler_decode_floor.py /opt/glm53/test_scheduler_decode_floor.py
+COPY overlay/patch_hybrid_prefix_hit.py /opt/glm53/patch_hybrid_prefix_hit.py
+COPY tests/test_hybrid_prefix_hit.py /opt/glm53/test_hybrid_prefix_hit.py
 RUN python3 /opt/glm53/patch_model_overrides.py
 RUN python3 /opt/glm53/patch_dflash2.py
 RUN python3 /opt/glm53/patch_glm_eagle3.py
 RUN python3 /opt/glm53/patch_glm5_drafter_group.py
 RUN python3 /opt/glm53/patch_suppress_stops_in_reasoning.py
 RUN python3 /opt/glm53/patch_scheduler_decode_floor.py
+RUN python3 /opt/glm53/patch_hybrid_prefix_hit.py
 
 RUN EXL3_SELFCHECK_GPU=0 python3 /opt/glm53/test_exl3_overlay.py \
     && python3 /opt/glm53/test_suppress_stops.py \
-    && python3 /opt/glm53/test_scheduler_decode_floor.py
+    && python3 /opt/glm53/test_scheduler_decode_floor.py \
+    && python3 /opt/glm53/test_hybrid_prefix_hit.py
