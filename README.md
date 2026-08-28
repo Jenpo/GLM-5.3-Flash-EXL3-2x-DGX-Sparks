@@ -82,7 +82,7 @@ K6 (`malaiwah/GLM-5.3-Flash-TR3-6bpw`) is a different checkpoint.
 | Worker | `WORKER_USER@WORKER_IP` (this kit: `zurih@10.0.0.2`), `--headless`, `glm53-exl3-worker` |
 | Fabric | CX7 QSFP: `enp1s0f1np1`/`rocep1s0f1` ↔ `enp1s0f0np0`/`rocep1s0f0`. Image NCCL (`USE_HOST_NCCL=0`) |
 | Attention | `FLASHINFER_MLA_SPARSE_SM120` (NoPE MLA padded into GLM_NSA 576-wide) |
-| KV | `--kv-cache-dtype fp8` → packed **`fp8_ds_mla`** |
+| KV | `--kv-cache-dtype fp8` → packed **`fp8_ds_mla`**. `--enable-prefix-caching` (block-aligned hits; see Prefix caching) |
 | Experts | packed trellis + suh + svh + mcg, codebook MCG, **one fused `exllamav3_ext.exl3_moe` launch per layer** |
 | Dense / shared / attn / embed / lm_head | native (unquantized) |
 | Spec | **DFlash2 k=7** (`incoai/GLM-5.3-Flash-DFlash2`); draft KV `auto`/bf16, draft TP=1, FLASH_ATTN. Rollback `SPEC_METHOD=mtp` |
@@ -137,6 +137,34 @@ Keep **`SKIP_MM_PROFILING=1`** — a max-size image+video dummy profile OOMs thi
 
 **NVFP4 KV is not available here.** FlashInfer’s SM12x NVFP4 kernels are dense MHA,
 not sparse MLA. Do not confuse that with NVFP4 **weights** (`--moe-backend marlin`).
+
+## Prefix caching (this kit, 2026-08-28)
+
+`--enable-prefix-caching` is on. The OpenAI API is **stateless**: the client
+resends the full history each turn; vLLM hashes that prefix. Concurrent chats
+do **not** mix activations. `--max-num-seqs 4` is four **in-flight** generations,
+not four parked sessions. This boot’s pool was **926,373** tokens (CUDA-graph
+memory profiling; recipe table above is 982,612). MLA `KpoolTailManager`
+disables **fine-grained** hits — only **block-aligned** tokens count.
+
+Live A/B, temp **0**, thinking **off**, two distinct ~7.7k-token chats:
+
+| Turn | Prefix hits | Compute | Prompt tok | TTFT |
+|---|---:|---:|---:|---:|
+| A cold | 0 | 7734 | 7734 | 10.5 s |
+| A follow-up | **3584** | 4176 | 7760 | 11.4 s |
+| B cold (different text) | 0 | 7734 | 7734 | 10.5 s |
+| B follow-up | **3584** | 4176 | 7760 | 5.9 s |
+| A again after B | **0** | 7786 | 7786 | 10.8 s |
+| A+B concurrent | 3584 total | rest recomputed | 7748 each | A 9.5 s / B 16.1 s |
+
+Isolation held: A answered `STILL_A` / `CONCUR_A`, B answered `CONCUR_B`.
+
+A follow-up reused **46%** of the prompt (3584 / 7760), not the whole history.
+After talking in B, A’s prefix was gone. Concurrent A+B: only one session hit.
+Idle chats are not reserved in the pool. Expect prefill on later turns of an
+old window; only the next turn of a still-hashed, block-aligned prefix skips
+part of it.
 
 ## Quick start (2× Spark)
 
