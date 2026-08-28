@@ -176,10 +176,10 @@ Live occupancy, temp **0**, thinking **off**, unique pads, `max_tokens=8`:
 | ~36k ×1 (compact-64, no slot-share) | 200 | **44.6%** | — | five standalone DFlash ID sets |
 | ~36k ×1 (padded slot-share) | 200 | **~16%** | — | one shared ID set |
 | ~36k ×3 concurrent | **3× 200** | **21%** (two in flight) | 54 / 96 / 137 s | `GLM53_MIXED_PREFILL_CHUNK=skip` still serializes prefills (`Running: 1`, others wait on capacity, then deferred) |
+| ~256k ×3 concurrent | **3× 200** | **29.5%** (two in flight) | 305 / 608 / 916 s | live on the 900k boot; 256,013 prompt tokens each, gen `OK`; third waited (skip) |
 | ~300k ×1 streamed | **200** | **26.0%** | **356 s** TTFT (~840 tok/s) | 299,213 prompt tokens, gen `OK` |
 
-3×256k = 768k **<** 1.75M logged. Hybrid occupancy is a large length-independent
-floor (mamba + DFlash window) plus MLA pages that scale: 36k → 16%, 300k → 26%.
+Live **3×256k** held (the original failure). Prefills still serialize under skip; two 256k contexts were in KV at once at 29.5%. One 256k sat ~25%. Hybrid occupancy is a large length-independent floor (mamba + DFlash window) plus MLA pages that scale: 36k → 16%, 256k → ~25%, 300k → 26%.
 Default is **1M**. Do **not** drop `MAX_MODEL_LEN` to 256k to “free” slots —
 logged tokens ≈ concurrency × that cap, and the hybrid floor then shrinks the
 pool.
