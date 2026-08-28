@@ -24,20 +24,20 @@ inside the draft block on this image and collapses later-position accept).
 
 ## Decode (this kit, 2026-08-28)
 
-Warm, single-stream, `temperature=0`, thinking **off** (`chat_template_kwargs` at
-top level — nested `extra_body` is ignored). Decode tok/s =
-`(completion_tokens − 1) / (end − first_token)`. CUDA graphs on, fused EXL3 MoE,
-`--max-model-len 900000`, KV pool **982,612** tokens (1.09× a full 900k request) at util 0.87.
+Official numbers: sparkDash Decode bench, DFlash2 k=7, **Structured** (count 1→200) and **Code** (`clamp_00`…`clamp_49`) — same high-accept regime. Temp **0**, thinking **off**, 400 tokens, CUDA graphs, fused EXL3 MoE. Prompt types, not grammar / schema. Stream tok/s is per request; aggregate is all streams.
 
-| Workload | Spec | tok/s | accept / draft | accepted / step |
-|---|---|---:|---:|---:|
-| **Structured count 1→200** (median of 5 × 400 tokens) | **DFlash2 k=7** | **61.7** (61.6–63.3) | **0.918** | **6.43** |
-| **Prose** (hash-map explanation, median of 5 × 400 tokens) | DFlash2 k=7 | **26.9** (24.4–30.9) | **0.332** | **2.33** |
-| Long context / mixed (engine ~60–100k KV) | DFlash2 k=7 | 24–27 | ~0.36 | ~2.5 |
-| MTP k=2 baseline (pre-DFlash2) | MTP | ~24.6 | — | — |
+| Concurrency | TTFT | Stream tok/s | Aggregate tok/s |
+|---|---:|---:|---:|
+| **×1** | **719 ms** | **62.9** | **62.9** |
+| **×2** | 6.62 s | 51.7 | 103.3 |
+| **×4** | 6.30 s | 37.1 | 146.5 |
 
-Structured per-pos (median run): **0.98 / 0.98 / 0.94 / 0.94 / 0.91 / 0.83 / 0.83**.
-Prose per-pos (median run): **0.75 / 0.58 / 0.41 / 0.28 / 0.16 / 0.09 / 0.06**.
+Serve recipe is `--max-model-len 900000` with KV pool **982,612** tokens (1.09× a full 900k request) at util 0.87. These runs are warm / empty KV — they do not need a filled 900k cache.
+
+Lab `tests/bench_decode.py` on the same protocol (median of 5 × 400, C1): Structured **61.7** tok/s (0.918 accept / 6.43 per step); Prose (hash-map) **26.9** (0.332 / 2.33). Long context / mixed (~60–100k KV) 24–27. MTP k=2 baseline ~24.6.
+
+Structured per-pos (lab median): **0.98 / 0.98 / 0.94 / 0.94 / 0.91 / 0.83 / 0.83**.
+Prose per-pos: **0.75 / 0.58 / 0.41 / 0.28 / 0.16 / 0.09 / 0.06**.
 Pinning `attention_backend=TRITON_ATTN` dropped structured to ~29 tok/s / 0.31 accept
 (pos0 healthy, later positions collapsed).
 
@@ -160,7 +160,7 @@ SPEC_METHOD=mtp ./start.sh restart      # MTP k=2
 The worker does not need GHCR credentials — only the head pulls, then ships the image over SSH.
 
 ```bash
-./download.sh                              # head HF cache only (no worker)
+./download.sh                              # head HF cache only (no worker); same as ./start.sh download
 SKIP_DOWNLOAD=1 SKIP_SYNC=1 ./start.sh     # weights already local on both nodes
 PULL=1 SKIP_DOWNLOAD=1 SKIP_SYNC=1 ./start.sh restart   # re-pull GHCR + ship
 BUILD=1 SKIP_DOWNLOAD=1 SKIP_SYNC=1 ./start.sh restart  # rebuild overlay from this repo + ship
@@ -179,7 +179,8 @@ curl -s http://127.0.0.1:8888/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "GLM-5.3-Flash-ELX3",
-    "messages": [{"role": "user", "content": "hello!"}]
+    "messages": [{"role": "user", "content": "hello!"}],
+    "chat_template_kwargs": {"enable_thinking": false}
   }'
 ```
 
@@ -226,7 +227,7 @@ your cabling differs. `ncclCommInitRank` hangs without them.
 | `EXL3_FUSED_MOE` | `1` | `exl3_moe` per layer; `0` = LinearEXL3 loop |
 | `KV_CACHE_DTYPE` | `fp8` | packed `fp8_ds_mla`; not `nvfp4`, not bf16 |
 | `GPU_MEM_UTIL` | `0.87` | GB10 UMA budget (DFlash2 + vision; live pool 982,612 tokens) |
-| `MAX_MODEL_LEN` | `900000` | default context; 1.09× headroom vs the 982,612-token pool. Native 1M does not allocate |
+| `MAX_MODEL_LEN` | `900000` | default context. The 982,612-token pool is **1.09×** a full 900k request. Native 1M does not allocate |
 | `MAX_NUM_SEQS` | `4` | decode batch; MTP adds k+1 tokens/seq |
 | `MAX_NUM_BATCHED_TOKENS` | `1024` | prefill chunk; 8192 oversubscribes GB10 indexer topk on long context |
 | `LANGUAGE_MODEL_ONLY` | `0` | load vision tower (image + video) |
@@ -271,7 +272,7 @@ Image-build runs `EXL3_SELFCHECK_GPU=0`. `./start.sh` runs the GPU self-check
 
 ## Do not
 
-- Destroy HF weights, requantize, `REFRESH_WEIGHTS=1`, or `docker rm` HF caches
+- Destroy HF weights, requantize, or `docker rm` HF caches. `REFRESH_WEIGHTS=1 ./download.sh` only if you intend to re-fetch
 - `--moe-backend marlin`, NVFP4 weights, or `glm53-flash-sm121:v8` as this serve
 - qemu / amd64 / `cstechdev/vllm:glm53-flash-nope-sm120-*` / verdictai SM120 B12X
 - `--kv-cache-dtype nvfp4` or bf16 (no sparse-MLA kernel)
