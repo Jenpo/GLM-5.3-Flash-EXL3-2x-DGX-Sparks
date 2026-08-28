@@ -36,7 +36,7 @@ Official numbers: sparkDash Decode bench, DFlash2 k=7, **Structured** (count 1�
 | **×2** | 6.62 s | 51.7 | 103.3 |
 | **×4** | 6.30 s | 37.1 | 146.5 |
 
-Serve recipe is `--max-model-len 900000` with KV pool **982,612** tokens (1.09× a full 900k request) at util 0.87. These runs are warm / empty KV — they do not need a filled 900k cache.
+Serve recipe is `--max-model-len 900000` with KV pool **1,754,237** tokens (1.95× a full 900k request) at util 0.87. These runs are warm / empty KV — they do not need a filled 900k cache.
 
 Lab `tests/bench_decode.py` on the same protocol (median of 5 × 400, C1): Structured **61.7** tok/s (0.918 accept / 6.43 per step); Prose (hash-map) **26.9** (0.332 / 2.33). Long context / mixed (~60–100k KV) 24–27. MTP k=2 baseline ~24.6.
 
@@ -70,7 +70,9 @@ scores the **weights**, not this GB10 overlay. We serve the **4bpw** row.
 | NVFP4 (brandonmusic stack, v44) | 0.060535 | ~180 GB |
 
 On the same stack, 4bpw matches official FP8 (~1.00× KLD) at **54%** of the bytes.
-K6 (`malaiwah/GLM-5.3-Flash-TR3-6bpw`) is a different checkpoint.
+K6 (`malaiwah/GLM-5.3-Flash-TR3-6bpw`) is a different checkpoint. Padded DFlash
+slot-share is an allocator change only — target KV stays packed `fp8_ds_mla`,
+same path as the compact-64 fp8 serve (not NVFP4 KV).
 
 ## What runs
 
@@ -85,11 +87,11 @@ K6 (`malaiwah/GLM-5.3-Flash-TR3-6bpw`) is a different checkpoint.
 | Worker | `WORKER_USER@WORKER_IP` (this kit: `zurih@10.0.0.2`), `--headless`, `glm53-exl3-worker` |
 | Fabric | CX7 QSFP: `enp1s0f1np1`/`rocep1s0f1` ↔ `enp1s0f0np0`/`rocep1s0f0`. Image NCCL (`USE_HOST_NCCL=0`) |
 | Attention | `FLASHINFER_MLA_SPARSE_SM120` (NoPE MLA padded into GLM_NSA 576-wide) |
-| KV | `--kv-cache-dtype fp8` → packed **`fp8_ds_mla`**. `--enable-prefix-caching` (block-aligned hits; see Prefix caching) |
+| KV | `--kv-cache-dtype fp8` → packed **`fp8_ds_mla`** (target). Draft DFlash2 KV is `auto`/bf16. Live pool **1,754,237** tokens / **1.95×** at 900k / 690 GPU blocks / 18.67 GiB. `--enable-prefix-caching` (block-aligned hits; see Prefix caching) |
 | Experts | packed trellis + suh + svh + mcg, codebook MCG, **one fused `exllamav3_ext.exl3_moe` launch per layer** |
 | Dense / shared / attn / embed / lm_head | native (unquantized) |
 | Spec | **DFlash2 k=7** (`incoai/GLM-5.3-Flash-DFlash2`); draft KV `auto`/bf16, draft TP=1, FLASH_ATTN. Rollback `SPEC_METHOD=mtp` |
-| Context | **900k** (`MAX_MODEL_LEN=900000`). Pool **982,612** tokens (~15.67 GiB fp8 MLA) at util 0.87 — 1.09× a full 900k request. Native 1M still does not allocate |
+| Context | **900k** (`MAX_MODEL_LEN=900000`). Live pool **1,754,237** tokens (1.95×) / 690 GPU blocks / 18.67 GiB. Keep this cap: lowering `max-model-len` to 256k does **not** turn leftover UMA into extra 256k slots (hybrid mamba + DFlash window block-id demand is mostly length-independent) |
 | Tools / reasoning | `--tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm45` |
 | Graphs | on (`ENFORCE_EAGER=0`) — MTP capture `1 2 3 4 6 8 12`; DFlash2 capture `1 2 4 8 16 24 32` |
 | Vision | on (`LANGUAGE_MODEL_ONLY=0`) — image + video, `--limit-mm-per-prompt {image:4,video:1}`, `--skip-mm-profiling` |
@@ -115,8 +117,9 @@ the MoE runner all-reduces once per layer.
 
 DFlash2 on this fork also needs three GLM-specific hooks the stock image lacks:
 EAGLE3 aux capture at mHC (`hc_post` then `hc_contract` → 4096-wide, taps log as
-`(6, 15, 25, 34, 43)`), drafter SWA **slot-sharing the MLA KV pages** (never
-`page_size_padded` — the generic uniform-page path cannot serve this hybrid), and
+`(6, 15, 25, 34, 43)`), drafter SWA **padded slot-share** onto the MLA tensors
+(`block_size=64`, `page_size_padded` equal to the MLA page so drafter layer i
+co-owns MLA tensor i; the layout validator allows that one padded case), and
 checkpoint `is_causal: false` so draft attention is bidirectional inside the
 block. Draft KV is forced `auto` because dense DFlash2 cannot use the target's
 `fp8_ds_mla` layout and SM121 has no FA3/FA4 for plain FP8.
@@ -126,14 +129,59 @@ the glm46v path and aligns placeholder blocks to encoder `grid_t`. The overlay
 also disables GB10 `persistent_topk` so long-history decode uses
 `top_k_per_row_decode`.
 
-## KV cache
+## KV cache (this kit, 2026-08-29)
 
 `--kv-cache-dtype fp8` is required. The SM12x sparse-MLA kernel only accepts packed
-`fp8_ds_mla`. **bf16 KV has no sparse kernel** on this arch. With DFlash2 + vision
-+ util **0.87**, the pool is **982,612 tokens** (~15.67 GiB fp8 MLA) at
-`--max-model-len 900000` (1.09× a full 900k request). The drafter costs ~0 extra
-pool (it slot-shares MLA tensors). Native 1M still does not fit; the previous
-800k recipe at util 0.86 was **837,065** tokens (1.05×).
+`fp8_ds_mla`. **bf16 KV has no sparse kernel** on this arch. Metrics report
+`cache_dtype=fp8`; that is the **target** path. The logged **1,754,237** tokens
+are hybrid BlockPool accounting, not 1.75M tokens of uniform fp8 tensors.
+
+| Piece | Dtype / layout | Notes |
+|---|---|---|
+| Target MLA (12 layers) | packed **`fp8_ds_mla`**, 656 B/token/layer | `FLASHINFER_MLA_SPARSE_SM120` |
+| Indexer / kpool tail | follows the GLM-5-Next hybrid groups | kernel block 64 |
+| Mamba (33 layers, 3 groups) | `mamba_cache_dtype=auto` | window / state, mostly length-independent |
+| DFlash2 draft (5 SWA layers) | **`auto`/bf16**, 2048 B/token this boot | no MLA FP8 backend on SM121 |
+
+With DFlash2 + vision + util **0.87**, the pool is leftover UMA after weights and
+CUDA graphs. Live boot (confirm `padded slot-share` and `Maximum concurrency`
+in the log):
+
+| | |
+|---|---|
+| GPU KV cache size | **1,754,237** tokens |
+| Max concurrency at 900k | **1.95×** |
+| GPU blocks | **690** (`block_size=64`, `mamba_block_size=16`) |
+| Available KV memory | **18.67 GiB** |
+| `kv_cache_max_concurrency` | 1.949… |
+| Boot line | `padded slot-share block=64 mla_page=2351104 (was block=16); draft_bytes/token=2048` |
+
+DFlash2 cannot exact-fit the 656 B MLA page, so the five SWA layers **padded
+slot-share** the MLA tensors: manager `block_size=64` (indexer kernel size; not
+the 3584-token mamba-aligned MLA manager) and `page_size_padded` equal to the
+MLA page. Drafter layer *i* co-owns MLA tensor *i* at window-bounded BlockPool
+IDs, like mamba. Per-block pool bytes unchanged. This is an **allocator**
+change — target attention is still the same `fp8_ds_mla` kernel and scales as
+the compact-64 fp8 serve. It is not NVFP4 KV.
+
+Inheriting the MLA manager block (1152, later 3584) made each of 5 draft layers
+tens of MiB per pool block and pinned logged concurrency near 1×
+`max-model-len`. Compact-64 without slot-share still burned unique IDs per
+draft layer.
+
+Live occupancy, temp **0**, thinking **off**, unique pads, `max_tokens=8`:
+
+| Load | HTTP | Peak KV | Wall / TTFT | Notes |
+|---|---|---:|---:|---|
+| ~36k ×1 (compact-64, no slot-share) | 200 | **44.6%** | — | five standalone DFlash ID sets |
+| ~36k ×1 (padded slot-share) | 200 | **~16%** | — | one shared ID set |
+| ~36k ×3 concurrent | **3× 200** | **21%** (two in flight) | 54 / 96 / 137 s | `GLM53_MIXED_PREFILL_CHUNK=skip` still serializes prefills (`Running: 1`, others wait on capacity, then deferred) |
+| ~300k ×1 streamed | **200** | **26.0%** | **356 s** TTFT (~840 tok/s) | 299,213 prompt tokens, gen `OK` |
+
+3×256k = 768k **<** 1.75M logged. Hybrid occupancy is a large length-independent
+floor (mamba + DFlash window) plus MLA pages that scale: 36k → 16%, 300k → 26%.
+Do **not** drop `MAX_MODEL_LEN` to 256k to “free” slots — logged tokens ≈
+concurrency × that cap, and the hybrid floor then shrinks the pool.
 
 Keep **`SKIP_MM_PROFILING=1`** — a max-size image+video dummy profile OOMs this UMA.
 `LIMIT_MM={"image":4,"video":1}`.
@@ -146,8 +194,8 @@ not sparse MLA. Do not confuse that with NVFP4 **weights** (`--moe-backend marli
 `--enable-prefix-caching` is on. The OpenAI API is **stateless**: the client
 resends the full history each turn; vLLM hashes that prefix. Concurrent chats
 do **not** mix activations. `--max-num-seqs 4` is four **in-flight** generations,
-not four parked sessions. This boot’s pool was **926,373** tokens (CUDA-graph
-memory profiling; recipe table above is 982,612). MLA `KpoolTailManager`
+not four parked sessions. This boot’s pool is **1,754,237** tokens (1.95× at
+900k; CUDA-graph memory profiling). MLA `KpoolTailManager`
 disables **fine-grained** hits — only **block-aligned** tokens count.
 
 Live A/B, temp **0**, thinking **off**, two distinct ~7.7k-token chats:
@@ -278,8 +326,8 @@ your cabling differs. `ncclCommInitRank` hangs without them.
 | `ENFORCE_EAGER` | `0` | CUDA graphs; MTP capture `1 2 3 4 6 8 12`, DFlash2 `1 2 4 8 16 24 32` |
 | `EXL3_FUSED_MOE` | `1` | `exl3_moe` per layer; `0` = LinearEXL3 loop |
 | `KV_CACHE_DTYPE` | `fp8` | packed `fp8_ds_mla`; not `nvfp4`, not bf16 |
-| `GPU_MEM_UTIL` | `0.87` | GB10 UMA budget (DFlash2 + vision; live pool 982,612 tokens) |
-| `MAX_MODEL_LEN` | `900000` | default context. The 982,612-token pool is **1.09×** a full 900k request. Native 1M does not allocate |
+| `GPU_MEM_UTIL` | `0.87` | GB10 UMA budget (DFlash2 + vision; live pool **1,754,237** tokens / **1.95×** / 690 blocks / 18.67 GiB) |
+| `MAX_MODEL_LEN` | `900000` | default context. Do not drop this to 256k to “free” KV for 3-way 256k — logged tokens ≈ concurrency × this cap; hybrid block-id overhead then shrinks the pool |
 | `MAX_NUM_SEQS` | `4` | decode batch; MTP adds k+1 tokens/seq |
 | `MAX_NUM_BATCHED_TOKENS` | `1024` | prefill chunk; 8192 oversubscribes GB10 indexer topk on long context |
 | `GLM53_MIXED_PREFILL_CHUNK` | `skip` | do not mix a peer prefill into a decode step (issue #6). `N>0` = cap tokens; `0` = off. Solo prefill stays 1024 |
@@ -320,7 +368,7 @@ this Dockerfile instead. After CUDA compile, Python overlay edits
 | `overlay/dflash2_speculator.py` | DFlash2 selector walk (V2 speculator) |
 | `overlay/patch_dflash2.py` | registry + `decoder_layer_cls` + speculator dispatch + draft KV `auto` on MLA/FP8 |
 | `overlay/patch_glm_eagle3.py` | Glm5Next EAGLE3 aux-hidden layers (mHC `hc_post` + contract) |
-| `overlay/patch_glm5_drafter_group.py` | keep GLM KV fast path; DFlash2 SWA slot-shares MLA pages (no padding) |
+| `overlay/patch_glm5_drafter_group.py` | GLM KV fast path + DFlash2 padded slot-share (`block=64`, `page_size_padded=mla_page`); runtime-mounted by `start.sh` (`DRAFTER_PATCH_HOST`) |
 | `overlay/patch_glm_video_placeholders.py` | align video timestamp blocks to encoder `grid_t` |
 | `overlay/patch_suppress_stops_in_reasoning.py` | fail-closed detokenizer guard: client `stop` dormant until `</think>` |
 | `overlay/patch_scheduler_decode_floor.py` | skip (or cap) peer prefill while another seq is decoding |

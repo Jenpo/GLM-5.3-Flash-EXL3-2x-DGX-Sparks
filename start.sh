@@ -139,6 +139,7 @@ CHAT_TEMPLATE="${CHAT_TEMPLATE:-/opt/glm53/chat_template.jinja}"
 VIDEO_PATCH_HOST="${VIDEO_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_glm_video_placeholders.py}"
 STOP_PATCH_HOST="${STOP_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_suppress_stops_in_reasoning.py}"
 SCHED_PATCH_HOST="${SCHED_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_scheduler_decode_floor.py}"
+DRAFTER_PATCH_HOST="${DRAFTER_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_glm5_drafter_group.py}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 QUANTIZATION="${QUANTIZATION:-exl3}"
 LANGUAGE_MODEL_ONLY="${LANGUAGE_MODEL_ONLY:-0}"
@@ -312,6 +313,7 @@ preflight() {
 
     [ -f "$STOP_PATCH_HOST" ] || die "$STOP_PATCH_HOST missing"
     [ -f "$SCHED_PATCH_HOST" ] || die "$SCHED_PATCH_HOST missing"
+    [ -f "$DRAFTER_PATCH_HOST" ] || die "$DRAFTER_PATCH_HOST missing"
 
     local need_kb=$((180 * 1024 * 1024)) avail
     mkdir -p "$HF_CACHE_DIR"
@@ -707,6 +709,9 @@ fi
 if [ -f /opt/glm53/patch_scheduler_decode_floor.py ]; then
     python3 /opt/glm53/patch_scheduler_decode_floor.py
 fi
+if [ -f /opt/glm53/patch_glm5_drafter_group.py ]; then
+    python3 /opt/glm53/patch_glm5_drafter_group.py
+fi
 say "launching: vllm serve ${MODEL_DIR} ${ARGS[*]}"
 exec vllm serve "${MODEL_DIR}" "${ARGS[@]}"
 EOF
@@ -777,6 +782,9 @@ fi
 if [ -f /opt/glm53/patch_scheduler_decode_floor.py ]; then
     python3 /opt/glm53/patch_scheduler_decode_floor.py
 fi
+if [ -f /opt/glm53/patch_glm5_drafter_group.py ]; then
+    python3 /opt/glm53/patch_glm5_drafter_group.py
+fi
 say "joining TP2 at ${HEAD_IP}:${MASTER_PORT} as rank 1"
 exec vllm serve "${MODEL_DIR}" "${ARGS[@]}"
 EOF
@@ -799,6 +807,8 @@ launch_cluster() {
     scp -q -o BatchMode=yes "$STOP_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_suppress_stops_in_reasoning.py"
     [ -f "$SCHED_PATCH_HOST" ] || die "missing $SCHED_PATCH_HOST"
     scp -q -o BatchMode=yes "$SCHED_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_scheduler_decode_floor.py"
+    [ -f "$DRAFTER_PATCH_HOST" ] || die "missing $DRAFTER_PATCH_HOST"
+    scp -q -o BatchMode=yes "$DRAFTER_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_glm5_drafter_group.py"
 
     local -a nccl_common=(
         -e NCCL_IB_DISABLE=0
@@ -878,6 +888,7 @@ launch_cluster() {
         -v '/tmp/patch_glm_video_placeholders.py:/opt/glm53/patch_glm_video_placeholders.py:ro' \
         -v '/tmp/patch_suppress_stops_in_reasoning.py:/opt/glm53/patch_suppress_stops_in_reasoning.py:ro' \
         -v '/tmp/patch_scheduler_decode_floor.py:/opt/glm53/patch_scheduler_decode_floor.py:ro' \
+        -v '/tmp/patch_glm5_drafter_group.py:/opt/glm53/patch_glm5_drafter_group.py:ro' \
         ${worker_preload} \
         ${worker_nccl} \
         -e NCCL_SOCKET_IFNAME='$WORKER_CX7_IF' \
@@ -901,6 +912,7 @@ launch_cluster() {
         -v "$VIDEO_PATCH_HOST:/opt/glm53/patch_glm_video_placeholders.py:ro" \
         -v "$STOP_PATCH_HOST:/opt/glm53/patch_suppress_stops_in_reasoning.py:ro" \
         -v "$SCHED_PATCH_HOST:/opt/glm53/patch_scheduler_decode_floor.py:ro" \
+        -v "$DRAFTER_PATCH_HOST:/opt/glm53/patch_glm5_drafter_group.py:ro" \
         "${head_preload[@]}" \
         "${nccl_common[@]}" \
         -e NCCL_SOCKET_IFNAME="$HEAD_CX7_IF" \
