@@ -190,33 +190,47 @@ Keep **`SKIP_MM_PROFILING=1`** — a max-size image+video dummy profile OOMs thi
 **NVFP4 KV is not available here.** FlashInfer’s SM12x NVFP4 kernels are dense MHA,
 not sparse MLA. Do not confuse that with NVFP4 **weights** (`--moe-backend marlin`).
 
-## Prefix caching (this kit, 2026-08-28)
+## Prefix caching (this kit, 2026-08-29)
 
 `--enable-prefix-caching` is on. The OpenAI API is **stateless**: the client
 resends the full history each turn; vLLM hashes that prefix. Concurrent chats
 do **not** mix activations. `--max-num-seqs 4` is four **in-flight** generations,
-not four parked sessions. This boot’s pool is **1,754,237** tokens (1.75× at
-1M; CUDA-graph memory profiling). MLA `KpoolTailManager`
-disables **fine-grained** hits — only **block-aligned** tokens count.
+not four parked sessions. MLA `KpoolTailManager` disables **fine-grained**
+hits — only **block-aligned** tokens count (3584-token hybrid align).
+`KpoolTail` already opts out of the hybrid min (1-block circular scratch).
 
-Live A/B, temp **0**, thinking **off**, two distinct ~7.7k-token chats:
+`dflash` is `use_eagle()`. GLM never sets `is_eagle_group` (that annotator is
+DeepseekV4-only), so stock HybridKVCacheCoordinator flagged **every** group.
+MLA dropped its last 3584-token page, and the DFlash2 SlidingWindow group
+re-aligned the min by another scheduler page. Overlay
+`patch_hybrid_prefix_hit.py` flags only the drafter SWA group as EAGLE and
+does **not** let that group shrink the MLA+mamba hit. Mamba stays in the min
+(skipping a mamba miss is a correctness hole). Do not raise
+`--max-num-batched-tokens` to “fix” APC.
 
-| Turn | Prefix hits | Compute | Prompt tok | TTFT |
+Live multi-turn, temp **0**, thinking **off**, real chat history
+(`user` + `assistant` + follow-up `user`), 1M serve:
+
+| Turn | Hits | Compute | Prompt tok | TTFT |
 |---|---:|---:|---:|---:|
-| A cold | 0 | 7734 | 7734 | 10.5 s |
-| A follow-up | **3584** | 4176 | 7760 | 11.4 s |
-| B cold (different text) | 0 | 7734 | 7734 | 10.5 s |
-| B follow-up | **3584** | 4176 | 7760 | 5.9 s |
-| A again after B | **0** | 7786 | 7786 | 10.8 s |
-| A+B concurrent | 3584 total | rest recomputed | 7748 each | A 9.5 s / B 16.1 s |
+| ~7.7k cold | 0 | 7696 | 7696 | 9.7 s |
+| ~7.7k follow-up | **7168** | 549 | 7717 | **1.17 s** |
+| ~12k cold | 0 | 11994 | 11994 | 13.4 s |
+| ~12k follow-up | **10752** | 1263 | 12015 | **1.94 s** |
+| ~16k cold | 0 | 15994 | 15994 | 17.7 s |
+| ~16k follow-up | **14336** | 1679 | 16015 | **2.18 s** |
+| 4× ~7.5k concurrent follow-ups | **7168 each** (28672 total) | rest | 7515 each | **1.86–2.50 s** |
 
-Isolation held: A answered `STILL_A` / `CONCUR_A`, B answered `CONCUR_B`.
+A ~7.7k follow-up reuses **93%** of the prompt (7168 / 7717), not 46%.
+Hits work **below** UserHIJ’s 14,336-token floor (that floor is 896-chunk ×
+2048-align LCM on a different geometry; this kit’s 3584 is 4×896). Isolation
+held (`STILL_READY_S` / `STILL_C0`…`C3`). Idle chats are not reserved; after
+the pool drains, a later turn of an old window prefills again. Concurrent
+colds still serialize under `GLM53_MIXED_PREFILL_CHUNK=skip` (`Deferred`).
 
-A follow-up reused **46%** of the prompt (3584 / 7760), not the whole history.
-After talking in B, A’s prefix was gone. Concurrent A+B: only one session hit.
-Idle chats are not reserved in the pool. Expect prefill on later turns of an
-old window; only the next turn of a still-hashed, block-aligned prefix skips
-part of it.
+This 1M boot: **1,670,157** tokens / **1.67×** / 638 GPU blocks (padded
+slot-share still applied). The 900k process measured 1,754,237 / 690 blocks
+on the same recipe; the delta is leftover UMA, not a slot-share collapse.
 
 ## Quick start (2× Spark)
 
