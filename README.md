@@ -12,7 +12,7 @@ OpenAI-compatible vLLM serve of
 **[brandonmusic/GLM-5.3-Flash-tr3-4bpw](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw)**
 (uniform-K4 EXL3/TR3 routed-experts, 4 bpw, ~164 GiB, 120 shards) on a **2× NVIDIA GB10**
 kit: tensor-parallel size 2 over CX7, native `sm_121a` cubins, API on `:8888`.
-Served model id: **`GLM-5.3-Flash-ELX3`**. EXL3/TR3 quant by
+Served model id: **`GLM-5.3-Flash-EXL3`**. EXL3/TR3 quant by
 [brandonmusic](https://huggingface.co/brandonmusic).
 
 This is **EXL3 weights + fp8 KV** on GB10. Do not pass `--moe-backend marlin`.
@@ -75,7 +75,7 @@ K6 (`malaiwah/GLM-5.3-Flash-TR3-6bpw`) is a different checkpoint.
 |---|---|
 | API | vLLM OpenAI (`/v1/chat/completions`) on the head, port **8888** |
 | Weights | `brandonmusic/GLM-5.3-Flash-tr3-4bpw` (snapshot `5ab363a8…`) |
-| Model id | `GLM-5.3-Flash-ELX3` (`--served-model-name`) |
+| Model id | `GLM-5.3-Flash-EXL3` (`--served-model-name`) |
 | Image | `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` FROM `vllm/vllm-openai:glm53-flash-arm64-cu130@sha256:905c0293…` (arm64, CUDA 13.0) |
 | Executor | `mp`, `--nnodes 2`, `--tensor-parallel-size 2` |
 | Head | this machine, `HEAD_IP=10.0.0.1`, container `glm53-exl3-head` |
@@ -141,12 +141,11 @@ not sparse MLA. Do not confuse that with NVFP4 **weights** (`--moe-backend marli
 ## Quick start (2× Spark)
 
 ```bash
-# GHCR is private — once per machine (PAT with read:packages)
-echo YOUR_PAT | docker login ghcr.io -u YOUR_GITHUB_USER --password-stdin
-
+git clone https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks.git
+cd GLM-5.3-Flash-EXL3-2x-DGX-Sparks
 cp .env.example .env          # edit HEAD_IP / WORKER_IP / WORKER_USER if needed
 ./download.sh                 # optional: EXL3 + DFlash2 into the head HF cache only
-./start.sh                    # pull image, download if missing, rsync, launch TP=2
+./start.sh                    # pull public GHCR :exl3, download if missing, rsync, launch TP=2
 ```
 
 First run of `./start.sh` copies `.env.example` → `.env` if missing. Prefix env
@@ -170,18 +169,18 @@ SPEC_METHOD=mtp ./start.sh restart      # MTP k=2
 `./start.sh` will:
 
 1. Preflight docker/ssh/disk on both nodes
-2. `docker pull` `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` if that tag is missing on the head (or whenever `PULL=1`); then `docker save | ssh docker load` onto the worker
+2. `docker pull` `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` (public; no login) on every start, then `docker save | ssh docker load` onto the worker if the digest changed. `SKIP_PULL=1` keeps a local copy.
 3. Download the TR3 EXL3 repo into `$HF_HOME` / `~/.cache/huggingface` (~164 GiB, 120 shards) if missing. Same job as `./download.sh`, which stops here (head only).
 4. `rsync` that cache to `${WORKER_HOME}/.cache/huggingface`
 5. Start rank 1 `--headless` on the worker, rank 0 + API on the head
 6. Poll `/health` (weight load + warmup is slow; `READY_TIMEOUT` default 3600s)
 
-The worker does not need GHCR credentials — only the head pulls, then ships the image over SSH.
+The worker does not need GHCR access — only the head pulls, then ships the image over SSH.
 
 ```bash
 ./download.sh                              # head HF cache only (no worker); same as ./start.sh download
 SKIP_DOWNLOAD=1 SKIP_SYNC=1 ./start.sh     # weights already local on both nodes
-PULL=1 SKIP_DOWNLOAD=1 SKIP_SYNC=1 ./start.sh restart   # re-pull GHCR + ship
+SKIP_PULL=1 SKIP_DOWNLOAD=1 SKIP_SYNC=1 ./start.sh restart  # keep local image, no GHCR
 BUILD=1 SKIP_DOWNLOAD=1 SKIP_SYNC=1 ./start.sh restart  # rebuild overlay from this repo + ship
 ./start.sh status
 ./start.sh logs                # head
@@ -197,7 +196,7 @@ API: `http://127.0.0.1:8888/v1` (LAN: `http://10.0.0.1:8888/v1`).
 curl -s http://127.0.0.1:8888/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "GLM-5.3-Flash-ELX3",
+    "model": "GLM-5.3-Flash-EXL3",
     "messages": [{"role": "user", "content": "hello!"}],
     "chat_template_kwargs": {"enable_thinking": false}
   }'
@@ -213,8 +212,9 @@ the request overrides. The launcher sets
 `--chat-template /opt/glm53/chat_template.jinja` (checkpoint jinja is language-only).
 
 Needs: Docker (no sudo) on both nodes, passwordless SSH head → worker,
-`docker login ghcr.io` on the head (private image), `hf` / `huggingface-cli` +
-`curl` + `rsync` on the head, ~180 GiB free per node for the first download.
+`hf` / `huggingface-cli` + `curl` + `rsync` on the head, ~180 GiB free per
+node for the first download. The GHCR image is public; login is only needed
+if you hit anonymous pull rate limits (`GHCR_TOKEN` + `GHCR_USER`).
 Mixed OS accounts: set `WORKER_USER` (this kit uses `zurih` on spark2).
 
 NCCL cannot use the `10.0.0.x` loopback aliases — leave the CX7 pins unless
@@ -229,9 +229,9 @@ your cabling differs. `ncclCommInitRank` hangs without them.
 | `WORKER_USER` | *(unset = `$USER`)* | SSH user on the worker |
 | `WORKER_HOME` | `$HOME` if same user, else `/home/$WORKER_USER` | worker HF cache |
 | `MODEL` | `brandonmusic/GLM-5.3-Flash-tr3-4bpw` | Hub repo into the HF cache |
-| `SERVED_MODEL_NAME` | `GLM-5.3-Flash-ELX3` | OpenAI `model` id (`/v1/models`) |
-| `IMAGE` | `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` | serve image (`PULL=1` re-pulls; `BUILD=1` rebuilds the overlay) |
-| `GHCR_TOKEN` / `GHCR_USER` | *(unset)* | optional `docker login ghcr.io` before pull |
+| `SERVED_MODEL_NAME` | `GLM-5.3-Flash-EXL3` | OpenAI `model` id (`/v1/models`) |
+| `IMAGE` | `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` | public GHCR tag; pulled on every start. `SKIP_PULL=1` skips. `BUILD=1` rebuilds the overlay |
+| `GHCR_TOKEN` / `GHCR_USER` | *(unset)* | optional login if anonymous GHCR pull is rate-limited |
 | `PORT` | `8888` | OpenAI API on the head |
 | `TP` / `NNODES` | `2` / `2` | do not change for this recipe |
 | `QUANTIZATION` | `exl3` | overlay method; never `marlin` |
@@ -263,8 +263,8 @@ docker build -t glm53-flash-sm121:local .
 # or: BUILD=1 ./start.sh
 ```
 
-`./start.sh` **pulls** `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` if
-that tag is missing (`PULL=1` re-pulls). `BUILD=1` rebuilds the overlay from
+`./start.sh` **pulls** `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3`
+(public) on every start unless `SKIP_PULL=1`. `BUILD=1` rebuilds the overlay from
 this Dockerfile instead. After CUDA compile, Python overlay edits
 (`overlay/exl3.py`, tests) are a cheap layer so they do not rebuild
 `exllamav3_ext`.

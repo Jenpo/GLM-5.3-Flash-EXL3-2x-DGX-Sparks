@@ -16,9 +16,10 @@
 #
 # What we do:
 #   1. preflight  — docker/ssh/disk on both nodes
-#   2. image      — docker pull IMAGE from GHCR if missing; ship to the
-#                   worker with docker save | ssh docker load. BUILD=1
-#                   rebuilds the overlay from this repo instead.
+#   2. image      — docker pull IMAGE from GHCR (public :exl3 tag), then
+#                   ship to the worker with docker save | ssh docker load.
+#                   SKIP_PULL=1 keeps a local copy. BUILD=1 rebuilds from
+#                   this repo instead. Local-only tags (no slash) skip pull.
 #   3. download   — EXL3/TR3 (+ DFlash2) into the local HF cache if missing
 #   4. sync       — rsync that cache to the worker (each rank loads local disk)
 #   5. launch     — worker --headless, then head + `vllm serve` (both
@@ -36,7 +37,7 @@
 #   ./start.sh logs worker        follow worker container logs
 #
 # Node IPs live in .env (copied from .env.example on first run).
-# Handy overrides: SKIP_DOWNLOAD=1 SKIP_SYNC=1 PULL=1 BUILD=1 TAIL=1 HF_TOKEN=...
+# Handy overrides: SKIP_DOWNLOAD=1 SKIP_SYNC=1 SKIP_PULL=1 PULL=1 BUILD=1 TAIL=1 HF_TOKEN=...
 # ============================================================================
 set -euo pipefail
 
@@ -313,10 +314,10 @@ pull_image() {
     login_ghcr_if_token
     log "pulling ${IMAGE} ..."
     docker pull "$IMAGE" && return 0
-    die "docker pull ${IMAGE} failed (GHCR package is private).
-  echo YOUR_PAT | docker login ghcr.io -u YOUR_GITHUB_USER --password-stdin
-  PAT needs read:packages. Or set GHCR_TOKEN + GHCR_USER in .env.
-  Overlay rebuild instead: BUILD=1 ./start.sh"
+    die "docker pull ${IMAGE} failed.
+  :exl3 is a public GHCR package — check network / disk.
+  If you still get 401/403: echo YOUR_PAT | docker login ghcr.io -u YOUR_GITHUB_USER --password-stdin
+  Or set GHCR_TOKEN + GHCR_USER in .env. Overlay rebuild: BUILD=1 ./start.sh"
 }
 
 ship_image_to_worker() {
@@ -340,16 +341,39 @@ ensure_image() {
             log "worker image id differs — will ship ${IMAGE}"
         fi
     fi
+    local skip_pull="${SKIP_PULL:-0}"
+    [ "${PULL:-0}" = "1" ] && skip_pull=0
     if [ "${BUILD:-0}" = "1" ]; then
         build_image
         refresh=1
-    elif [ "$head_ok" = "0" ] || [ "${PULL:-0}" = "1" ]; then
-        if image_from_registry && [ "${SKIP_PULL:-0}" != "1" ]; then
-            pull_image
+        head_id="$(docker image inspect -f '{{.Id}}' "$IMAGE")"
+        head_ok=1
+        worker_ok=0
+    elif image_from_registry && [ "$skip_pull" != "1" ]; then
+        local before_id="$head_id"
+        pull_image
+        head_id="$(docker image inspect -f '{{.Id}}' "$IMAGE")"
+        head_ok=1
+        if [ "$head_id" != "$before_id" ]; then
+            refresh=1
+            log "pulled ${IMAGE} (${before_id:-missing} -> ${head_id})"
         else
-            build_image
+            log "${IMAGE} already current"
         fi
+        if [ -n "$worker_id" ] && [ "$worker_id" = "$head_id" ]; then
+            worker_ok=1
+        else
+            worker_ok=0
+        fi
+    elif [ "$head_ok" = "0" ]; then
+        if image_from_registry && [ "$skip_pull" = "1" ]; then
+            die "SKIP_PULL=1 but ${IMAGE} is not on the head"
+        fi
+        build_image
         refresh=1
+        head_id="$(docker image inspect -f '{{.Id}}' "$IMAGE")"
+        head_ok=1
+        worker_ok=0
     fi
     if [ "$worker_ok" = "0" ] || [ "$refresh" = "1" ]; then
         ship_image_to_worker
