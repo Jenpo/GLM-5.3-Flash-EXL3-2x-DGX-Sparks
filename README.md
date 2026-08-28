@@ -51,6 +51,24 @@ python3 tests/bench_decode.py --phase structured --structured --runs 5 --max-tok
 python3 tests/bench_decode.py --phase prose --runs 5 --max-tokens 400 --skip-coherence --out /tmp/glm53-prose.json
 ```
 
+## Quality (KLD)
+
+Independent teacher-logit panel from
+[malaiwah on the 4bpw discussion](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw/discussions/1#6a9144846b0bdba943bfe86f):
+KLD(teacher ‖ model), five cold runs, 25 sealed windows (51,175 positions). This
+scores the **weights**, not this GB10 overlay. We serve the **4bpw** row.
+
+| Model | Mean KLD (nats) | Size |
+|---|---:|---:|
+| TR3 K6 (6bpw) | 0.013723 | 254 GB |
+| Official FP8 (cross-stack) | 0.020615 | 328 GB |
+| **This checkpoint — EXL3 4bpw** | **0.024555** | **176 GB** |
+| Official FP8 (brandonmusic stack, v44) | 0.024629 | 328 GB |
+| NVFP4 (brandonmusic stack, v44) | 0.060535 | ~180 GB |
+
+On the same stack, 4bpw matches official FP8 (~1.00× KLD) at **54%** of the bytes.
+K6 (`malaiwah/GLM-5.3-Flash-TR3-6bpw`) is a different checkpoint.
+
 ## What runs
 
 | Layer | Runtime |
@@ -291,4 +309,6 @@ Image-build runs `EXL3_SELFCHECK_GPU=0`. `./start.sh` runs the GPU self-check
 - **DFlash2 drafter:** [IncoAI](https://huggingface.co/incoai) —
   [GLM-5.3-Flash-DFlash2](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2)
   (CC BY-NC-ND 4.0, research/eval)
+- **KLD panel:** [malaiwah](https://huggingface.co/malaiwah) —
+  [discussion #1](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw/discussions/1#6a9144846b0bdba943bfe86f)
 
