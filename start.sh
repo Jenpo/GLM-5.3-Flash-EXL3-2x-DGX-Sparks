@@ -17,10 +17,12 @@
 #
 # What we do:
 #   1. preflight  — docker/ssh/disk on both nodes
-#   2. image      — docker pull IMAGE from GHCR (public :exl3 tag), then
-#                   ship to the worker with docker save | ssh docker load.
-#                   SKIP_PULL=1 keeps a local copy. BUILD=1 rebuilds from
-#                   this repo instead. Local-only tags (no slash) skip pull.
+#   2. image      — docker pull IMAGE from GHCR (public :exl3 tag). If the
+#                   worker is missing that digest, try docker pull there,
+#                   then fall back to docker save --platform | ssh docker
+#                   load (issue #8). SKIP_PULL=1 keeps a local copy.
+#                   BUILD=1 rebuilds from this repo instead. Local-only
+#                   tags (no slash) skip pull. SKIP_SHIP=1 never copies.
 #   3. download   — EXL3/TR3 (+ DFlash2) into the local HF cache if missing
 #   4. sync       — rsync that cache to the worker (each rank loads local disk)
 #   5. launch     — worker --headless, then head + `vllm serve` (both
@@ -39,7 +41,7 @@
 #   ./start.sh logs worker        follow worker container logs
 #
 # Node IPs live in .env (copied from .env.example on first run).
-# Handy overrides: SKIP_DOWNLOAD=1 SKIP_SYNC=1 SKIP_PULL=1 PULL=1 BUILD=1 TAIL=1 HF_TOKEN=...
+# Handy overrides: SKIP_DOWNLOAD=1 SKIP_SYNC=1 SKIP_PULL=1 SKIP_SHIP=1 PULL=1 BUILD=1 TAIL=1 HF_TOKEN=...
 # ============================================================================
 set -euo pipefail
 
@@ -217,7 +219,7 @@ banner() {
     printf '\n'
 }
 
-worker_ssh() { ssh -o BatchMode=yes -o ConnectTimeout=15 "$WORKER_SSH" "$@"; }
+worker_ssh() { ssh -T -o BatchMode=yes -o ConnectTimeout=15 "$WORKER_SSH" "$@"; }
 
 usage() { sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
@@ -335,6 +337,44 @@ login_ghcr_if_token() {
     echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin >/dev/null
 }
 
+login_ghcr_if_token_worker() {
+    [ -n "${GHCR_TOKEN:-}" ] || return 0
+    log "docker login ghcr.io on worker as ${GHCR_USER} (GHCR_TOKEN)"
+    echo "$GHCR_TOKEN" | worker_ssh "docker login ghcr.io -u '$GHCR_USER' --password-stdin" >/dev/null
+}
+
+# RepoDigest is stable across overlay2 vs containerd. Those snapshotters
+# disagree on .Id (config digest vs index digest), so start.sh used to
+# ship even after the worker had already pulled the same GHCR tag (issue #8).
+# Local builds have no RepoDigest — use RootFS layer diffs, then .Id.
+_IMAGE_KEY_FMT='{{if .RepoDigests}}{{index .RepoDigests 0}}{{else if .RootFS.Layers}}{{join .RootFS.Layers ","}}{{else}}{{.Id}}{{end}}'
+
+parse_image_key() {
+    tr -d '\r' | sed -n 's/^GLM53KEY //p' | tail -n 1
+}
+
+local_image_key() {
+    docker image inspect -f "GLM53KEY ${_IMAGE_KEY_FMT}" "$IMAGE" 2>/dev/null | parse_image_key
+}
+
+worker_image_key() {
+    worker_ssh "docker image inspect -f 'GLM53KEY ${_IMAGE_KEY_FMT}' '$IMAGE' 2>/dev/null" | parse_image_key
+}
+
+images_match() {
+    [ -n "${1:-}" ] && [ -n "${2:-}" ] && [ "$1" = "$2" ]
+}
+
+image_platform() {
+    if [ -n "${IMAGE_PLATFORM:-}" ]; then
+        printf '%s' "$IMAGE_PLATFORM"
+        return
+    fi
+    local p
+    p="$(docker image inspect -f '{{.Os}}/{{.Architecture}}' "$IMAGE" 2>/dev/null || true)"
+    printf '%s' "${p:-linux/arm64}"
+}
+
 build_image() {
     log "building ${IMAGE} from Dockerfile (log: $LOGDIR/build-sm121.log) ..."
     docker build -t "$IMAGE" "$SCRIPT_DIR" \
@@ -352,47 +392,61 @@ pull_image() {
   Or set GHCR_TOKEN + GHCR_USER in .env. Overlay rebuild: BUILD=1 ./start.sh"
 }
 
+pull_image_on_worker() {
+    login_ghcr_if_token_worker
+    log "pulling ${IMAGE} on worker ..."
+    worker_ssh "docker pull '$IMAGE'"
+}
+
 ship_image_to_worker() {
-    log "shipping ${IMAGE} to worker via docker save | ssh docker load ..."
-    docker save "$IMAGE" | worker_ssh docker load >/dev/null
+    local platform
+    platform="$(image_platform)"
+    log "shipping ${IMAGE} (${platform}) to worker via docker save | ssh docker load ..."
+    # A multi-arch OCI index references blobs docker save does not pack
+    # (only the native platform is local). docker load then dies with:
+    #   open /var/lib/docker/tmp/docker-import-*/blobs/sha256/<id>: no such file
+    # (issue #8). --platform emits a complete single-manifest tar.
+    if docker save --platform "$platform" "$IMAGE" | worker_ssh docker load; then
+        return 0
+    fi
+    warn "docker save --platform ${platform} failed — retrying without --platform"
+    docker save "$IMAGE" | worker_ssh docker load
 }
 
 ensure_image() {
     mkdir -p "$LOGDIR"
-    local head_ok=0 worker_ok=0 head_id="" worker_id="" refresh=0
+    local head_ok=0 worker_ok=0 head_key="" worker_key=""
     if docker image inspect "$IMAGE" >/dev/null 2>&1; then
         head_ok=1
-        head_id="$(docker image inspect -f '{{.Id}}' "$IMAGE")"
+        head_key="$(local_image_key)"
     fi
     if worker_ssh "docker image inspect '$IMAGE' >/dev/null 2>&1"; then
-        worker_id="$(worker_ssh "docker image inspect -f '{{.Id}}' '$IMAGE'")"
-        if [ -n "$head_id" ] && [ "$worker_id" = "$head_id" ]; then
+        worker_key="$(worker_image_key)"
+        if images_match "$head_key" "$worker_key"; then
             worker_ok=1
         else
             worker_ok=0
-            log "worker image id differs — will ship ${IMAGE}"
+            log "worker image differs (head=${head_key:-none} worker=${worker_key:-none}) — will refresh worker"
         fi
     fi
     local skip_pull="${SKIP_PULL:-0}"
     [ "${PULL:-0}" = "1" ] && skip_pull=0
     if [ "${BUILD:-0}" = "1" ]; then
         build_image
-        refresh=1
-        head_id="$(docker image inspect -f '{{.Id}}' "$IMAGE")"
+        head_key="$(local_image_key)"
         head_ok=1
         worker_ok=0
     elif image_from_registry && [ "$skip_pull" != "1" ]; then
-        local before_id="$head_id"
+        local before_key="$head_key"
         pull_image
-        head_id="$(docker image inspect -f '{{.Id}}' "$IMAGE")"
+        head_key="$(local_image_key)"
         head_ok=1
-        if [ "$head_id" != "$before_id" ]; then
-            refresh=1
-            log "pulled ${IMAGE} (${before_id:-missing} -> ${head_id})"
+        if [ "$head_key" != "$before_key" ]; then
+            log "pulled ${IMAGE} (${before_key:-missing} -> ${head_key})"
         else
             log "${IMAGE} already current"
         fi
-        if [ -n "$worker_id" ] && [ "$worker_id" = "$head_id" ]; then
+        if images_match "$worker_key" "$head_key"; then
             worker_ok=1
         else
             worker_ok=0
@@ -402,13 +456,38 @@ ensure_image() {
             die "SKIP_PULL=1 but ${IMAGE} is not on the head"
         fi
         build_image
-        refresh=1
-        head_id="$(docker image inspect -f '{{.Id}}' "$IMAGE")"
+        head_key="$(local_image_key)"
         head_ok=1
         worker_ok=0
     fi
-    if [ "$worker_ok" = "0" ] || [ "$refresh" = "1" ]; then
-        ship_image_to_worker
+    if [ "${SKIP_SHIP:-0}" = "1" ]; then
+        [ "$worker_ok" = "1" ] || warn "SKIP_SHIP=1 — not copying ${IMAGE} to the worker"
+    elif [ "$worker_ok" = "0" ]; then
+        if image_from_registry && [ "$skip_pull" != "1" ] && [ "${BUILD:-0}" != "1" ]; then
+            if pull_image_on_worker; then
+                worker_key="$(worker_image_key)"
+                if images_match "$head_key" "$worker_key"; then
+                    worker_ok=1
+                    log "worker pulled ${IMAGE} — matches head"
+                else
+                    warn "worker pull left a different image (head=${head_key:-none} worker=${worker_key:-none}) — shipping"
+                fi
+            else
+                warn "worker docker pull failed — shipping over SSH (worker does not need GHCR)"
+            fi
+        fi
+        if [ "$worker_ok" = "0" ]; then
+            ship_image_to_worker
+            worker_key="$(worker_image_key)"
+            if images_match "$head_key" "$worker_key"; then
+                worker_ok=1
+            elif worker_ssh "docker image inspect '$IMAGE' >/dev/null 2>&1"; then
+                warn "worker has ${IMAGE} after ship but keys still differ (head=${head_key:-none} worker=${worker_key:-none}) — continuing"
+                worker_ok=1
+            else
+                die "worker still missing ${IMAGE} after ship"
+            fi
+        fi
     fi
     if [ "${SKIP_OVERLAY_VERIFY:-0}" != "1" ]; then
         log "GPU EXL3 self-check on ${IMAGE} (log: $LOGDIR/overlay-verify.log) ..."
