@@ -19,7 +19,7 @@
 #   2. image      — docker pull IMAGE from GHCR if missing; ship to the
 #                   worker with docker save | ssh docker load. BUILD=1
 #                   rebuilds the overlay from this repo instead.
-#   3. download   — EXL3/TR3 weights into the local HF cache if missing (~164 GiB)
+#   3. download   — EXL3/TR3 (+ DFlash2) into the local HF cache if missing
 #   4. sync       — rsync that cache to the worker (each rank loads local disk)
 #   5. launch     — worker --headless, then head + `vllm serve` (both
 #                   --network host --ipc=host)
@@ -27,6 +27,8 @@
 #
 # Usage:
 #   ./start.sh                    start (download/sync/launch) — default
+#   ./start.sh download           EXL3 (+ DFlash2) into the head HF cache only
+#                                 (no worker). Same as ./download.sh
 #   ./start.sh stop               stop both nodes
 #   ./start.sh restart            stop + start
 #   ./start.sh status             containers + API health
@@ -117,8 +119,8 @@ DFLASH_TOKENS="${DFLASH_TOKENS:-7}"
 # prefers FLASH_ATTN for non-causal dense SWA. TRITON_ATTN was an SM120
 # mask-fix copy this image does not have.
 DFLASH_DRAFT_TP="${DFLASH_DRAFT_TP-1}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-1048576}"
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.86}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-900000}"
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.87}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
 # 8192 chunk × long history oversubscribes GB10 persistent_topk smem (300k crash).
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-1024}"
@@ -187,7 +189,7 @@ banner() {
 
 worker_ssh() { ssh -o BatchMode=yes -o ConnectTimeout=15 "$WORKER_SSH" "$@"; }
 
-usage() { sed -n '2,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 count_shards() {
     find "$1/snapshots" -name '*.safetensors' 2>/dev/null | wc -l | tr -d '[:space:]' || true
@@ -421,6 +423,36 @@ download_dflash() {
     log "DFlash2 download complete"
 }
 
+# Head-only Hub fetch. No docker, no SSH, no worker rsync.
+download_only() {
+    local hf have
+    hf="$(command -v hf || command -v huggingface-cli || true)"
+    [ -n "$hf" ] || die "neither 'hf' nor 'huggingface-cli' found — pip install --user -U 'huggingface_hub[cli]'"
+    mkdir -p "$HF_CACHE_DIR"
+    local need_kb=$((180 * 1024 * 1024)) avail
+    avail=$(df -Pk "$HF_CACHE_DIR" 2>/dev/null | awk 'NR==2{print $4}' || true)
+    [ "${avail:-0}" -ge "$need_kb" ] || warn "only $((avail/1024/1024)) GiB free on this disk for a ~164 GiB model"
+
+    # Explicit download: do not honor SKIP_DOWNLOAD from .env.
+    SKIP_DOWNLOAD=0
+    download_weights
+    download_dflash
+
+    have="$(count_shards "$MODEL_PATH")"
+    log "======================================================================"
+    log "head HF cache : ${HF_CACHE_DIR}"
+    log "  target      : ${MODEL}  (${have} / ${EXPECTED_SHARDS} shards)"
+    log "  snapshot    : ${MODEL_PATH}"
+    if [ "$SPEC_METHOD" = "dflash" ]; then
+        log "  DFlash2     : ${DFLASH_MODEL}"
+        log "  draft cache : ${DFLASH_PATH}"
+    else
+        log "  DFlash2     : skipped (SPEC_METHOD=${SPEC_METHOD})"
+    fi
+    log "worker was not touched. ./start.sh will rsync on launch unless SKIP_SYNC=1."
+    log "======================================================================"
+}
+
 # ------------------------------ weight sync --------------------------------
 sync_weights() {
     [ "${SKIP_SYNC:-0}" = "1" ] && { log "SKIP_SYNC=1 — not syncing to worker"; return; }
@@ -605,6 +637,10 @@ launch_cluster() {
         -e FLASHINFER_DISABLE_VERSION_CHECK=1
         -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
         -e "VLLM_ENGINE_READY_TIMEOUT_S=$READY_TIMEOUT"
+        # py-cpuinfo JSON-parses empty output on Grace/aarch64; the usage
+        # thread then dumps JSONDecodeError. Stats are off on this private kit.
+        -e VLLM_NO_USAGE_STATS=1
+        -e DO_NOT_TRACK=1
     )
     local worker_nccl="" e
     for e in "${nccl_common[@]}"; do
@@ -846,17 +882,18 @@ logs() {
 # ------------------------------- main --------------------------------------
 main() {
     local cmd="${1:-start}"
-    if [ "$cmd" = stop ]; then
-        banner stop.sh
-    else
-        banner start.sh
-    fi
     case "$cmd" in
-        start)   shift || true; start ;;
-        stop)    stop ;;
-        restart) stop; start ;;
-        status)  status ;;
-        logs)    shift || true; logs "$@" ;;
+        stop)     banner stop.sh ;;
+        download) banner download.sh ;;
+        *)        banner start.sh ;;
+    esac
+    case "$cmd" in
+        start)    shift || true; start ;;
+        download) download_only ;;
+        stop)     stop ;;
+        restart)  stop; start ;;
+        status)   status ;;
+        logs)     shift || true; logs "$@" ;;
         -h|--help|help) usage ;;
         *) usage; exit 1 ;;
     esac

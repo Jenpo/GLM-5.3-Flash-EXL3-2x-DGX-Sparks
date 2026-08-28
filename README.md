@@ -27,7 +27,7 @@ inside the draft block on this image and collapses later-position accept).
 Warm, single-stream, `temperature=0`, thinking **off** (`chat_template_kwargs` at
 top level — nested `extra_body` is ignored). Decode tok/s =
 `(completion_tokens − 1) / (end − first_token)`. CUDA graphs on, fused EXL3 MoE,
-`--max-model-len 800000`, KV pool **837,065** tokens (1.05× a full 800k request).
+`--max-model-len 900000`, KV pool **982,612** tokens (1.09× a full 900k request) at util 0.87.
 
 | Workload | Spec | tok/s | accept / draft | accepted / step |
 |---|---|---:|---:|---:|
@@ -67,7 +67,7 @@ python3 tests/bench_decode.py --phase prose --runs 5 --max-tokens 400 --skip-coh
 | Experts | packed trellis + suh + svh + mcg, codebook MCG, **one fused `exllamav3_ext.exl3_moe` launch per layer** |
 | Dense / shared / attn / embed / lm_head | native (unquantized) |
 | Spec | **DFlash2 k=7** (`incoai/GLM-5.3-Flash-DFlash2`); draft KV `auto`/bf16, draft TP=1, FLASH_ATTN. Rollback `SPEC_METHOD=mtp` |
-| Context | **800k** (`MAX_MODEL_LEN=800000`). Native 1M does not allocate with DFlash2 at util 0.86 (needed ~14.9 GiB KV, had ~14.3) |
+| Context | **900k** (`MAX_MODEL_LEN=900000`). Pool **982,612** tokens (~15.67 GiB fp8 MLA) at util 0.87 — 1.09× a full 900k request. Native 1M still does not allocate |
 | Tools / reasoning | `--tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm45` |
 | Graphs | on (`ENFORCE_EAGER=0`) — MTP capture `1 2 3 4 6 8 12`; DFlash2 capture `1 2 4 8 16 24 32` |
 | Vision | on (`LANGUAGE_MODEL_ONLY=0`) — image + video, `--limit-mm-per-prompt {image:4,video:1}`, `--skip-mm-profiling` |
@@ -108,9 +108,10 @@ also disables GB10 `persistent_topk` so long-history decode uses
 
 `--kv-cache-dtype fp8` is required. The SM12x sparse-MLA kernel only accepts packed
 `fp8_ds_mla`. **bf16 KV has no sparse kernel** on this arch. With DFlash2 + vision
-+ util **0.86**, the pool is **837,065 tokens** at `--max-model-len 800000`
-(1.05×). The drafter costs ~0 extra pool (it slot-shares MLA tensors). 1M context
-does not fit that slab; 512k left ~729k tokens (1.39×).
++ util **0.87**, the pool is **982,612 tokens** (~15.67 GiB fp8 MLA) at
+`--max-model-len 900000` (1.09× a full 900k request). The drafter costs ~0 extra
+pool (it slot-shares MLA tensors). Native 1M still does not fit; the previous
+800k recipe at util 0.86 was **837,065** tokens (1.05×).
 
 Keep **`SKIP_MM_PROFILING=1`** — a max-size image+video dummy profile OOMs this UMA.
 `LIMIT_MM={"image":4,"video":1}`.
@@ -125,11 +126,20 @@ not sparse MLA. Do not confuse that with NVFP4 **weights** (`--moe-backend marli
 echo YOUR_PAT | docker login ghcr.io -u YOUR_GITHUB_USER --password-stdin
 
 cp .env.example .env          # edit HEAD_IP / WORKER_IP / WORKER_USER if needed
-./start.sh                    # pull image, download EXL3, rsync, launch TP=2
+./download.sh                 # optional: EXL3 + DFlash2 into the head HF cache only
+./start.sh                    # pull image, download if missing, rsync, launch TP=2
 ```
 
 First run of `./start.sh` copies `.env.example` → `.env` if missing. Prefix env
 wins over `.env` (`SPEC_METHOD=dflash SKIP_DOWNLOAD=1 ./start.sh restart`).
+
+`./start.sh` downloads weights automatically when the HF cache is incomplete
+(120 shards of `brandonmusic/GLM-5.3-Flash-tr3-4bpw`, plus DFlash2 when
+`SPEC_METHOD=dflash`). `./download.sh` is the same Hub fetch **on this machine
+only** — no docker, no SSH, no worker rsync. Use it to stage ~164 GiB before
+the worker is ready. `REFRESH_WEIGHTS=1 ./download.sh` re-fetches.
+Already present: both scripts skip. `./start.sh` still rsyncs the cache to the
+worker unless `SKIP_SYNC=1`.
 
 DFlash2 (`incoai/GLM-5.3-Flash-DFlash2`, ~2.3 GiB BF16, CC BY-NC-ND 4.0 research/eval)
 is the default. Rollback:
@@ -142,7 +152,7 @@ SPEC_METHOD=mtp ./start.sh restart      # MTP k=2
 
 1. Preflight docker/ssh/disk on both nodes
 2. `docker pull` `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` if that tag is missing on the head (or whenever `PULL=1`); then `docker save | ssh docker load` onto the worker
-3. Download the TR3 EXL3 repo into `$HF_HOME` / `~/.cache/huggingface` (~164 GiB, 120 shards)
+3. Download the TR3 EXL3 repo into `$HF_HOME` / `~/.cache/huggingface` (~164 GiB, 120 shards) if missing. Same job as `./download.sh`, which stops here (head only).
 4. `rsync` that cache to `${WORKER_HOME}/.cache/huggingface`
 5. Start rank 1 `--headless` on the worker, rank 0 + API on the head
 6. Poll `/health` (weight load + warmup is slow; `READY_TIMEOUT` default 3600s)
@@ -150,6 +160,7 @@ SPEC_METHOD=mtp ./start.sh restart      # MTP k=2
 The worker does not need GHCR credentials — only the head pulls, then ships the image over SSH.
 
 ```bash
+./download.sh                              # head HF cache only (no worker)
 SKIP_DOWNLOAD=1 SKIP_SYNC=1 ./start.sh     # weights already local on both nodes
 PULL=1 SKIP_DOWNLOAD=1 SKIP_SYNC=1 ./start.sh restart   # re-pull GHCR + ship
 BUILD=1 SKIP_DOWNLOAD=1 SKIP_SYNC=1 ./start.sh restart  # rebuild overlay from this repo + ship
@@ -214,8 +225,8 @@ your cabling differs. `ncclCommInitRank` hangs without them.
 | `ENFORCE_EAGER` | `0` | CUDA graphs; MTP capture `1 2 3 4 6 8 12`, DFlash2 `1 2 4 8 16 24 32` |
 | `EXL3_FUSED_MOE` | `1` | `exl3_moe` per layer; `0` = LinearEXL3 loop |
 | `KV_CACHE_DTYPE` | `fp8` | packed `fp8_ds_mla`; not `nvfp4`, not bf16 |
-| `GPU_MEM_UTIL` | `0.86` | GB10 UMA budget (DFlash2 needs a little more headroom than MTP) |
-| `MAX_MODEL_LEN` | `800000` | what fits with DFlash2 + util 0.86 + vision. Native 1M does not allocate |
+| `GPU_MEM_UTIL` | `0.87` | GB10 UMA budget (DFlash2 + vision; live pool 982,612 tokens) |
+| `MAX_MODEL_LEN` | `900000` | default context; 1.09× headroom vs the 982,612-token pool. Native 1M does not allocate |
 | `MAX_NUM_SEQS` | `4` | decode batch; MTP adds k+1 tokens/seq |
 | `MAX_NUM_BATCHED_TOKENS` | `1024` | prefill chunk; 8192 oversubscribes GB10 indexer topk on long context |
 | `LANGUAGE_MODEL_ONLY` | `0` | load vision tower (image + video) |
@@ -246,7 +257,7 @@ this Dockerfile instead. After CUDA compile, Python overlay edits
 | `overlay/patch_model_overrides.py` | `"exl3"` in ModelConfig overrides |
 | `tests/test_exl3_overlay.py` | registry, TP shard, `sm_121a` cubin, fused vs loop GEMM, `EXL3_FUSED_MOE=0` |
 | `tests/bench_decode.py` | streaming decode + coherence; `--structured` is the count-1→200 median |
-| `start.sh` / `stop.sh` | 2-node launch |
+| `start.sh` / `stop.sh` / `download.sh` | 2-node launch; Hub fetch on the head only |
 | `files/chat_template.jinja` | GLM-5.3 MM template (`<|image|>` / `<|video|>`); checkpoint jinja is language-only |
 | `overlay/qwen3_dflash2.py` | DFlash2 draft (grouped conv + candidate selector) |
 | `overlay/dflash2_speculator.py` | DFlash2 selector walk (V2 speculator) |
