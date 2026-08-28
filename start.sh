@@ -3,7 +3,7 @@
 # start.sh — Spark runtime for GLM-5.3-Flash EXL3 (SM121 / GB10)
 # ============================================================================
 #
-# We serve Mia-AiLab/GLM-5.3-Flash-tr3-4bpw (mirror of
+# We serve Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw (mirror of
 # brandonmusic/GLM-5.3-Flash-tr3-4bpw @ 5ab363a8) on this 2× DGX Spark (GB10 /
 # SM121) kit: vLLM TP=2 over CX7, OpenAI API on :8888, NoPE-MLA overlay image.
 # DFlash2-7 is the default speculator. Target KV stays packed fp8_ds_mla;
@@ -81,13 +81,13 @@ set +a
 [ -n "${_cli_ablit_alpha}" ] && ABLIT_ALPHA="$_cli_ablit_alpha"
 
 # ----------------------------- configuration -------------------------------
-MODEL="${MODEL:-Mia-AiLab/GLM-5.3-Flash-tr3-4bpw}"
+MODEL="${MODEL:-Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw}"
 # If the durable mirror is empty/moved, download.sh falls back to this id.
 MODEL_FALLBACK="${MODEL_FALLBACK:-brandonmusic/GLM-5.3-Flash-tr3-4bpw}"
 MODEL_CACHE_NAME="${MODEL_CACHE_NAME:-models--${MODEL//\//--}}"
 MODEL_FALLBACK_CACHE_NAME="${MODEL_FALLBACK_CACHE_NAME:-models--${MODEL_FALLBACK//\//--}}"
 # Hub commit on the Mia-AiLab mirror (the 5ab363a8-byte-identical upload).
-MODEL_REVISION="${MODEL_REVISION:-05ffc7e0c7ff4581af415addbf5f219e7f51590a}"
+MODEL_REVISION="${MODEL_REVISION:-25a44fdbf16862a46b7cc9921142c6c81350af2f}"
 IMAGE="${IMAGE:-ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-GLM-5.3-Flash-EXL3}"
 GHCR_USER="${GHCR_USER:-MiaAI-Lab}"

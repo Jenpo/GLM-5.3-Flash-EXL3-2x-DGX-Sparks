@@ -9,7 +9,7 @@
 
 OpenAI-compatible vLLM serve of
 [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) as
-**[Mia-AiLab/GLM-5.3-Flash-tr3-4bpw](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-tr3-4bpw)**
+**[Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw)**
 — a byte-identical public mirror of
 [brandonmusic/GLM-5.3-Flash-tr3-4bpw](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw)
 snapshot `5ab363a8…` (uniform-K4 EXL3/TR3 routed-experts, 4 bpw, ~164 GiB, 120 shards)
@@ -77,7 +77,7 @@ K6 (`malaiwah/GLM-5.3-Flash-TR3-6bpw`) is a different checkpoint.
 | Layer | Runtime |
 |---|---|
 | API | vLLM OpenAI (`/v1/chat/completions`) on the head, port **8888** |
-| Weights | `Mia-AiLab/GLM-5.3-Flash-tr3-4bpw` (mirror of `brandonmusic/…` snapshot `5ab363a8…`) |
+| Weights | `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw` (mirror of `brandonmusic/…` snapshot `5ab363a8…`) |
 | Model id | `GLM-5.3-Flash-EXL3` (`--served-model-name`) |
 | Image | `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` FROM `vllm/vllm-openai:glm53-flash-arm64-cu130@sha256:905c0293…` (arm64, CUDA 13.0) |
 | Executor | `mp`, `--nnodes 2`, `--tensor-parallel-size 2` |
@@ -237,7 +237,7 @@ First run of `./start.sh` copies `.env.example` → `.env` if missing. Prefix en
 wins over `.env` (`SPEC_METHOD=dflash SKIP_DOWNLOAD=1 ./start.sh restart`).
 
 `./start.sh` downloads weights automatically when the HF cache is incomplete
-(120 shards of `Mia-AiLab/GLM-5.3-Flash-tr3-4bpw`, falling back to
+(120 shards of `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw`, falling back to
 `brandonmusic/GLM-5.3-Flash-tr3-4bpw` if the mirror is incomplete, plus DFlash2 when
 `SPEC_METHOD=dflash`). `./download.sh` is the same Hub fetch **on this machine
 only** — no docker, no SSH, no worker rsync. Use it to stage ~164 GiB before
@@ -314,7 +314,7 @@ your cabling differs. `ncclCommInitRank` hangs without them.
 | `WORKER_IP` | `10.0.0.2` | other Spark |
 | `WORKER_USER` | *(unset = `$USER`)* | SSH user on the worker |
 | `WORKER_HOME` | `$HOME` if same user, else `/home/$WORKER_USER` | worker HF cache |
-| `MODEL` | `Mia-AiLab/GLM-5.3-Flash-tr3-4bpw` | Hub repo into the HF cache (mirror) |
+| `MODEL` | `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw` | Hub repo into the HF cache (mirror) |
 | `MODEL_FALLBACK` | `brandonmusic/GLM-5.3-Flash-tr3-4bpw` | Used if the mirror 404s or has fewer than 120 shards |
 | `SERVED_MODEL_NAME` | `GLM-5.3-Flash-EXL3` | OpenAI `model` id (`/v1/models`) |
 | `IMAGE` | `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` | public GHCR tag; pulled on every start. `SKIP_PULL=1` skips. `BUILD=1` rebuilds the overlay |
@@ -394,7 +394,7 @@ Image-build runs `EXL3_SELFCHECK_GPU=0`. `./start.sh` runs the GPU self-check
 ## License
 
 This repository (serve scripts, overlay, docs) is **MIT**. The EXL3/TR3
-checkpoint stays [ShapleyMCG License 1.0](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-tr3-4bpw/blob/main/LICENSE)
+checkpoint stays [ShapleyMCG License 1.0](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw/blob/main/LICENSE)
 (unmodified upstream LICENSE; also on
 [brandonmusic/GLM-5.3-Flash-tr3-4bpw](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw)).
 DFlash2 stays [CC BY-NC-ND 4.0](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2).
@@ -404,7 +404,7 @@ DFlash2 stays [CC BY-NC-ND 4.0](https://huggingface.co/incoai/GLM-5.3-Flash-DFla
 - **EXL3/TR3 weights:** [brandonmusic](https://huggingface.co/brandonmusic) —
   [GLM-5.3-Flash-tr3-4bpw](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw)
   (uniform-K4 routed-experts, ShapleyMCG License 1.0). Public mirror for this
-  recipe: [Mia-AiLab/GLM-5.3-Flash-tr3-4bpw](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-tr3-4bpw)
+  recipe: [Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw)
 - **EXL3 format / kernels:** [turboderp](https://github.com/turboderp-org/exllamav3) (ExLlamaV3)
 - **Base model:** [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)
 - **DFlash2 drafter:** [IncoAI](https://huggingface.co/incoai) —
