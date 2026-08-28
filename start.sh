@@ -129,7 +129,7 @@ DFLASH_TOKENS="${DFLASH_TOKENS:-7}"
 # prefers FLASH_ATTN for non-causal dense SWA. TRITON_ATTN was an SM120
 # mask-fix copy this image does not have.
 DFLASH_DRAFT_TP="${DFLASH_DRAFT_TP-1}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-900000}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-1000000}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.87}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
 # 8192 chunk × long history oversubscribes GB10 persistent_topk smem (300k crash).

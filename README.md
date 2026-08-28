@@ -36,7 +36,7 @@ Official numbers: sparkDash Decode bench, DFlash2 k=7, **Structured** (count 1�
 | **×2** | 6.62 s | 51.7 | 103.3 |
 | **×4** | 6.30 s | 37.1 | 146.5 |
 
-Serve recipe is `--max-model-len 900000` with KV pool **1,754,237** tokens (1.95× a full 900k request) at util 0.87. These runs are warm / empty KV — they do not need a filled 900k cache.
+Serve recipe is `--max-model-len 1000000` with KV pool **1,754,237** tokens (1.75× a full 1M request) at util 0.87. These runs are warm / empty KV — they do not need a filled 1M cache.
 
 Lab `tests/bench_decode.py` on the same protocol (median of 5 × 400, C1): Structured **61.7** tok/s (0.918 accept / 6.43 per step); Prose (hash-map) **26.9** (0.332 / 2.33). Long context / mixed (~60–100k KV) 24–27. MTP k=2 baseline ~24.6.
 
@@ -87,11 +87,11 @@ same path as the compact-64 fp8 serve (not NVFP4 KV).
 | Worker | `WORKER_USER@WORKER_IP` (this kit: `zurih@10.0.0.2`), `--headless`, `glm53-exl3-worker` |
 | Fabric | CX7 QSFP: `enp1s0f1np1`/`rocep1s0f1` ↔ `enp1s0f0np0`/`rocep1s0f0`. Image NCCL (`USE_HOST_NCCL=0`) |
 | Attention | `FLASHINFER_MLA_SPARSE_SM120` (NoPE MLA padded into GLM_NSA 576-wide) |
-| KV | `--kv-cache-dtype fp8` → packed **`fp8_ds_mla`** (target). Draft DFlash2 KV is `auto`/bf16. Live pool **1,754,237** tokens / **1.95×** at 900k / 690 GPU blocks / 18.67 GiB. `--enable-prefix-caching` (block-aligned hits; see Prefix caching) |
+| KV | `--kv-cache-dtype fp8` → packed **`fp8_ds_mla`** (target). Draft DFlash2 KV is `auto`/bf16. Live pool **1,754,237** tokens / **1.75×** at 1M / 690 GPU blocks / 18.67 GiB. `--enable-prefix-caching` (block-aligned hits; see Prefix caching) |
 | Experts | packed trellis + suh + svh + mcg, codebook MCG, **one fused `exllamav3_ext.exl3_moe` launch per layer** |
 | Dense / shared / attn / embed / lm_head | native (unquantized) |
 | Spec | **DFlash2 k=7** (`incoai/GLM-5.3-Flash-DFlash2`); draft KV `auto`/bf16, draft TP=1, FLASH_ATTN. Rollback `SPEC_METHOD=mtp` |
-| Context | **900k** (`MAX_MODEL_LEN=900000`). Live pool **1,754,237** tokens (1.95×) / 690 GPU blocks / 18.67 GiB. Keep this cap: lowering `max-model-len` to 256k does **not** turn leftover UMA into extra 256k slots (hybrid mamba + DFlash window block-id demand is mostly length-independent) |
+| Context | **1M** (`MAX_MODEL_LEN=1000000`). Live pool **1,754,237** tokens (1.75×) / 690 GPU blocks / 18.67 GiB. Padded slot-share is why 1M allocates; the old 900k cap was 1.95× on this same pool. Do not drop to 256k to “free” slots (hybrid mamba + DFlash window block-id demand is mostly length-independent) |
 | Tools / reasoning | `--tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm45` |
 | Graphs | on (`ENFORCE_EAGER=0`) — MTP capture `1 2 3 4 6 8 12`; DFlash2 capture `1 2 4 8 16 24 32` |
 | Vision | on (`LANGUAGE_MODEL_ONLY=0`) — image + video, `--limit-mm-per-prompt {image:4,video:1}`, `--skip-mm-profiling` |
@@ -150,7 +150,7 @@ in the log):
 | | |
 |---|---|
 | GPU KV cache size | **1,754,237** tokens |
-| Max concurrency at 900k | **1.95×** |
+| Max concurrency at 1M | **1.75×** (same 1.75M pool; was 1.95× at 900k) |
 | GPU blocks | **690** (`block_size=64`, `mamba_block_size=16`) |
 | Available KV memory | **18.67 GiB** |
 | `kv_cache_max_concurrency` | 1.949… |
@@ -180,8 +180,9 @@ Live occupancy, temp **0**, thinking **off**, unique pads, `max_tokens=8`:
 
 3×256k = 768k **<** 1.75M logged. Hybrid occupancy is a large length-independent
 floor (mamba + DFlash window) plus MLA pages that scale: 36k → 16%, 300k → 26%.
-Do **not** drop `MAX_MODEL_LEN` to 256k to “free” slots — logged tokens ≈
-concurrency × that cap, and the hybrid floor then shrinks the pool.
+Default is **1M**. Do **not** drop `MAX_MODEL_LEN` to 256k to “free” slots —
+logged tokens ≈ concurrency × that cap, and the hybrid floor then shrinks the
+pool.
 
 Keep **`SKIP_MM_PROFILING=1`** — a max-size image+video dummy profile OOMs this UMA.
 `LIMIT_MM={"image":4,"video":1}`.
@@ -194,8 +195,8 @@ not sparse MLA. Do not confuse that with NVFP4 **weights** (`--moe-backend marli
 `--enable-prefix-caching` is on. The OpenAI API is **stateless**: the client
 resends the full history each turn; vLLM hashes that prefix. Concurrent chats
 do **not** mix activations. `--max-num-seqs 4` is four **in-flight** generations,
-not four parked sessions. This boot’s pool is **1,754,237** tokens (1.95× at
-900k; CUDA-graph memory profiling). MLA `KpoolTailManager`
+not four parked sessions. This boot’s pool is **1,754,237** tokens (1.75× at
+1M; CUDA-graph memory profiling). MLA `KpoolTailManager`
 disables **fine-grained** hits — only **block-aligned** tokens count.
 
 Live A/B, temp **0**, thinking **off**, two distinct ~7.7k-token chats:
@@ -326,8 +327,8 @@ your cabling differs. `ncclCommInitRank` hangs without them.
 | `ENFORCE_EAGER` | `0` | CUDA graphs; MTP capture `1 2 3 4 6 8 12`, DFlash2 `1 2 4 8 16 24 32` |
 | `EXL3_FUSED_MOE` | `1` | `exl3_moe` per layer; `0` = LinearEXL3 loop |
 | `KV_CACHE_DTYPE` | `fp8` | packed `fp8_ds_mla`; not `nvfp4`, not bf16 |
-| `GPU_MEM_UTIL` | `0.87` | GB10 UMA budget (DFlash2 + vision; live pool **1,754,237** tokens / **1.95×** / 690 blocks / 18.67 GiB) |
-| `MAX_MODEL_LEN` | `900000` | default context. Do not drop this to 256k to “free” KV for 3-way 256k — logged tokens ≈ concurrency × this cap; hybrid block-id overhead then shrinks the pool |
+| `GPU_MEM_UTIL` | `0.87` | GB10 UMA budget (DFlash2 + vision; live pool **1,754,237** tokens / **1.75×** at 1M / 690 blocks / 18.67 GiB) |
+| `MAX_MODEL_LEN` | `1000000` | default context. 1M allocates on the 1.75M padded-slot-share pool. Do not drop to 256k to “free” KV — logged tokens ≈ concurrency × this cap; hybrid block-id overhead then shrinks the pool |
 | `MAX_NUM_SEQS` | `4` | decode batch; MTP adds k+1 tokens/seq |
 | `MAX_NUM_BATCHED_TOKENS` | `1024` | prefill chunk; 8192 oversubscribes GB10 indexer topk on long context |
 | `GLM53_MIXED_PREFILL_CHUNK` | `skip` | do not mix a peer prefill into a decode step (issue #6). `N>0` = cap tokens; `0` = off. Solo prefill stays 1024 |
