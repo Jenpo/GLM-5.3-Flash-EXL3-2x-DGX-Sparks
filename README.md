@@ -327,6 +327,12 @@ Image-build runs `EXL3_SELFCHECK_GPU=0`. `./start.sh` runs the GPU self-check
 - Change TP, CX7 pins, or `USE_HOST_NCCL` unless you are re-plumbing NCCL
 - Force-push
 
+## License
+
+This repository (serve scripts, overlay, docs) is **MIT**. The EXL3/TR3
+checkpoint stays [ShapleyMCG License 1.0](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw);
+DFlash2 stays [CC BY-NC-ND 4.0](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2).
+
 ## Credits
 
 - **EXL3/TR3 weights:** [brandonmusic](https://huggingface.co/brandonmusic) —
