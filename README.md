@@ -259,7 +259,7 @@ SPEC_METHOD=mtp ./start.sh restart      # MTP k=2
 3. Download the TR3 EXL3 repo into `$HF_HOME` / `~/.cache/huggingface` (~164 GiB, 120 shards) if missing. Same job as `./download.sh`, which stops here (head only).
 4. `rsync` that cache to `${WORKER_HOME}/.cache/huggingface`
 5. Start rank 1 `--headless` on the worker, rank 0 + API on the head
-6. Poll `/health` (weight load + warmup is slow; `READY_TIMEOUT` default 3600s)
+6. Poll `/health` (weight load + warmup is slow; `READY_TIMEOUT` default 3600s), then a **nonfatal** DFlash2/sampler shape sweep so the first client is not the first JIT on TP=2. `GLM53_BOOT_SHAPE_WARMUP=0` skips it.
 
 The worker does not need GHCR access — only the head pulls, then ships the image over SSH.
 
@@ -337,6 +337,8 @@ your cabling differs. `ncclCommInitRank` hangs without them.
 | `MAX_NUM_SEQS` | `4` | decode batch; MTP adds k+1 tokens/seq |
 | `MAX_NUM_BATCHED_TOKENS` | `1024` | prefill chunk; 8192 oversubscribes GB10 indexer topk on long context |
 | `GLM53_SUPPRESS_STOPS_IN_REASONING` | `1` | ignore client `stop` strings until `</think>` (thinking-on default) |
+| `GLM53_BOOT_SHAPE_WARMUP` | `1` | after `/health`, burn DFlash2 BLOCK / sampler / kpool shapes (nonfatal) |
+| `TRITON_HOST_CACHE` / `TILELANG_HOST_CACHE` | `$CACHE_ROOT/triton` / `tilelang` | persist JIT caches across container recreate |
 | `LANGUAGE_MODEL_ONLY` | `0` | load vision tower (image + video) |
 | `SKIP_MM_PROFILING` | `1` | skip max-size MM dummy at init (OOM otherwise) |
 | `LIMIT_MM` | `{"image":4,"video":1}` | `--limit-mm-per-prompt` |
@@ -376,6 +378,7 @@ this Dockerfile instead. After CUDA compile, Python overlay edits
 | `overlay/ablit_runtime.py` | ABLIT: o_proj refusal-direction orthogonalization at load (`ABLIT=1`) |
 | `overlay/patch_ablit.py` | install the ABLIT hook into `Glm5NextModel` / `Glm5NextMTP` load (idempotent) |
 | `overlay/patch_suppress_stops_in_reasoning.py` | fail-closed detokenizer guard: client `stop` dormant until `</think>` |
+| `scripts/boot-shape-warmup.sh` | post-`/health` DFlash2 k=7 BLOCK ladder + sampler/kpool arms |
 | `ablit/` | direction vectors + `LAYER_MAP.json` from drowzeys' published ablit recipe |
 | `tests/test_ablit.py` | recipe integrity, orthogonalization math, TP-shard equivalence, hook gating |
 
