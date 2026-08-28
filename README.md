@@ -9,14 +9,17 @@
 
 OpenAI-compatible vLLM serve of
 [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) as
-**[brandonmusic/GLM-5.3-Flash-tr3-4bpw](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw)**
-(uniform-K4 EXL3/TR3 routed-experts, 4 bpw, ~164 GiB, 120 shards) on a **2× NVIDIA GB10**
+**[Mia-AiLab/GLM-5.3-Flash-tr3-4bpw](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-tr3-4bpw)**
+— a byte-identical public mirror of
+[brandonmusic/GLM-5.3-Flash-tr3-4bpw](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw)
+snapshot `5ab363a8…` (uniform-K4 EXL3/TR3 routed-experts, 4 bpw, ~164 GiB, 120 shards)
+so this recipe stays fetchable if the upstream Hub id moves. On a **2× NVIDIA GB10**
 kit: tensor-parallel size 2 over CX7, native `sm_121a` cubins, API on `:8888`.
 Served model id: **`GLM-5.3-Flash-EXL3`**. EXL3/TR3 quant by
 [brandonmusic](https://huggingface.co/brandonmusic).
 
 This is **EXL3 weights + fp8 KV** on GB10. Do not pass `--moe-backend marlin`.
-The Hub card's TP2/EP2/DCP2 + calibrated NVFP4 MLA KV recipe is the SM120 B12X
+The Hub card on brandonmusic (TP2/EP2/DCP2 + calibrated NVFP4 MLA KV) is the SM120 B12X
 image (`verdictai/glm53-flash-exl3-k4:…-v84-dflash2`), not this overlay. Target KV
 stays packed **`fp8_ds_mla`**. Speculator is **DFlash2 k=7**
 ([incoai/GLM-5.3-Flash-DFlash2](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2));
@@ -74,7 +77,7 @@ K6 (`malaiwah/GLM-5.3-Flash-TR3-6bpw`) is a different checkpoint.
 | Layer | Runtime |
 |---|---|
 | API | vLLM OpenAI (`/v1/chat/completions`) on the head, port **8888** |
-| Weights | `brandonmusic/GLM-5.3-Flash-tr3-4bpw` (snapshot `5ab363a8…`) |
+| Weights | `Mia-AiLab/GLM-5.3-Flash-tr3-4bpw` (mirror of `brandonmusic/…` snapshot `5ab363a8…`) |
 | Model id | `GLM-5.3-Flash-EXL3` (`--served-model-name`) |
 | Image | `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` FROM `vllm/vllm-openai:glm53-flash-arm64-cu130@sha256:905c0293…` (arm64, CUDA 13.0) |
 | Executor | `mp`, `--nnodes 2`, `--tensor-parallel-size 2` |
@@ -166,6 +169,60 @@ Idle chats are not reserved in the pool. Expect prefill on later turns of an
 old window; only the next turn of a still-hashed, block-aligned prefix skips
 part of it.
 
+## Abliteration (`ABLIT=1`)
+
+Optional refusal-direction ablation, applied at weight-load time on top of the
+EXL3 checkpoint — nothing is requantized or rewritten on disk. Artifacts live
+in `ablit/` (two ~18 KB fp32 direction vectors + `LAYER_MAP.json`) and come
+from
+[drowzeys/keys-GLM-5.3-Flash-NVFP4-ablit-l15-45-anchorstock](https://huggingface.co/drowzeys/keys-GLM-5.3-Flash-NVFP4-ablit-l15-45-anchorstock).
+The published recipe is **dealign-oproj-transplant**: every `self_attn.o_proj`
+in layers **15–45** is orthogonalized against the refusal direction, layers
+**0–14 stay stock** as safety anchors (keeps coherence while dropping
+refusals), and the checkpoint MTP block (layer 45) is included.
+
+The edit per o_proj (`W: [4096, in]`, `r`: fp32 direction, ‖r‖=1):
+
+```text
+W' = (I - alpha * r rᵀ) W      # default ABLIT_ALPHA=3.0 (alpha_ref)
+```
+
+Output components orthogonal to `r` are preserved exactly; the component
+along `r` is scaled by `1 − alpha` (alpha 3 inverts it — stronger
+over-projection; set `ABLIT_ALPHA=1.0` for the plain projection that zeroes
+it). Since o_proj is native BF16 here and `RowParallelLinear` shards only the
+input dim, the row-space edit is identical on both TP ranks with no
+collectives. Applied by `overlay/ablit_runtime.py`, installed by
+`overlay/patch_ablit.py` at the end of `Glm5NextModel.load_weights` /
+`Glm5NextMTP.load_weights` — before CUDA-graph capture, after the loaders are
+done. The DFlash2 drafter is never touched.
+
+Enable:
+
+```bash
+ABLIT=1 ./start.sh restart          # or set ABLIT=1 in .env, then ./start.sh restart
+./start.sh logs | grep ablit        # "orthogonalized layers.15.self_attn.o_proj …" per rank
+```
+
+Disable the same way (`ABLIT=0` / unset → hook is a no-op, stock weights).
+No rebuild: the artifacts + hook are bind-mounted into both containers on
+every `./start.sh`, so prebuilt GHCR images work too.
+
+| Knob | Default | What |
+|---|---|---|
+| `ABLIT` | `0` | `1` = apply the o_proj orthogonalization at load (both ranks) |
+| `ABLIT_DIRECTION` | `dealign` | `dealign` (published recipe) \| `bf_oproj` (blackfrost direction, `alpha_ref` 3.0) \| absolute path to a custom direction `.pt` |
+| `ABLIT_LAYERS` | `15-45` | inclusive range; `45` is the checkpoint MTP block |
+| `ABLIT_ALPHA` | `3.0` | projection scale. `1.0` = plain projection, >1 over-projects |
+| `ABLIT_INCLUDE_MTP` | `1` | also edit the MTP block's o_proj when it loads (`SPEC_METHOD=mtp`) |
+
+Caveats: the KLD quality panel above was measured **without** ablit; expect a
+refusal-behavior change and re-tune `ABLIT_ALPHA` if coherence degrades
+(lower it first). DFlash2 acceptance rates can shift a little (the drafter is
+stock while the target's outputs change). Provenance is the NVFP4 ablit
+checkpoint, but only the **direction vectors** are used here — the EXL3
+serve keeps its own weights, and o_proj is unquantized in both.
+
 ## Quick start (2× Spark)
 
 ```bash
@@ -180,7 +237,8 @@ First run of `./start.sh` copies `.env.example` → `.env` if missing. Prefix en
 wins over `.env` (`SPEC_METHOD=dflash SKIP_DOWNLOAD=1 ./start.sh restart`).
 
 `./start.sh` downloads weights automatically when the HF cache is incomplete
-(120 shards of `brandonmusic/GLM-5.3-Flash-tr3-4bpw`, plus DFlash2 when
+(120 shards of `Mia-AiLab/GLM-5.3-Flash-tr3-4bpw`, falling back to
+`brandonmusic/GLM-5.3-Flash-tr3-4bpw` if the mirror is incomplete, plus DFlash2 when
 `SPEC_METHOD=dflash`). `./download.sh` is the same Hub fetch **on this machine
 only** — no docker, no SSH, no worker rsync. Use it to stage ~164 GiB before
 the worker is ready. `REFRESH_WEIGHTS=1 ./download.sh` re-fetches.
@@ -256,7 +314,8 @@ your cabling differs. `ncclCommInitRank` hangs without them.
 | `WORKER_IP` | `10.0.0.2` | other Spark |
 | `WORKER_USER` | *(unset = `$USER`)* | SSH user on the worker |
 | `WORKER_HOME` | `$HOME` if same user, else `/home/$WORKER_USER` | worker HF cache |
-| `MODEL` | `brandonmusic/GLM-5.3-Flash-tr3-4bpw` | Hub repo into the HF cache |
+| `MODEL` | `Mia-AiLab/GLM-5.3-Flash-tr3-4bpw` | Hub repo into the HF cache (mirror) |
+| `MODEL_FALLBACK` | `brandonmusic/GLM-5.3-Flash-tr3-4bpw` | Used if the mirror 404s or has fewer than 120 shards |
 | `SERVED_MODEL_NAME` | `GLM-5.3-Flash-EXL3` | OpenAI `model` id (`/v1/models`) |
 | `IMAGE` | `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` | public GHCR tag; pulled on every start. `SKIP_PULL=1` skips. `BUILD=1` rebuilds the overlay |
 | `GHCR_TOKEN` / `GHCR_USER` | *(unset)* | optional login if anonymous GHCR pull is rate-limited |
@@ -313,6 +372,10 @@ this Dockerfile instead. After CUDA compile, Python overlay edits
 | `overlay/patch_glm_eagle3.py` | Glm5Next EAGLE3 aux-hidden layers (mHC `hc_post` + contract) |
 | `overlay/patch_glm5_drafter_group.py` | keep GLM KV fast path; DFlash2 SWA slot-shares MLA pages (no padding) |
 | `overlay/patch_glm_video_placeholders.py` | align video timestamp blocks to encoder `grid_t` |
+| `overlay/ablit_runtime.py` | ABLIT: o_proj refusal-direction orthogonalization at load (`ABLIT=1`) |
+| `overlay/patch_ablit.py` | install the ABLIT hook into `Glm5NextModel` / `Glm5NextMTP` load (idempotent) |
+| `ablit/` | direction vectors + `LAYER_MAP.json` from drowzeys' published ablit recipe |
+| `tests/test_ablit.py` | recipe integrity, orthogonalization math, TP-shard equivalence, hook gating |
 
 Image-build runs `EXL3_SELFCHECK_GPU=0`. `./start.sh` runs the GPU self-check
 (`docker run --gpus all`) before shipping unless `SKIP_OVERLAY_VERIFY=1`.
@@ -324,20 +387,24 @@ Image-build runs `EXL3_SELFCHECK_GPU=0`. `./start.sh` runs the GPU self-check
 - qemu / amd64 / `cstechdev/vllm:glm53-flash-nope-sm120-*` / verdictai SM120 B12X
 - `--kv-cache-dtype nvfp4` or bf16 (no sparse-MLA kernel)
 - `"attention_backend": "TRITON_ATTN"` in speculative-config (causal-in-block on this image)
+- Point `ABLIT_DIRECTION` at another checkpoint's direction without checking `hidden_size`, or commit edits to the `.pt` artifacts
 - Change TP, CX7 pins, or `USE_HOST_NCCL` unless you are re-plumbing NCCL
 - Force-push
 
 ## License
 
 This repository (serve scripts, overlay, docs) is **MIT**. The EXL3/TR3
-checkpoint stays [ShapleyMCG License 1.0](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw);
+checkpoint stays [ShapleyMCG License 1.0](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-tr3-4bpw/blob/main/LICENSE)
+(unmodified upstream LICENSE; also on
+[brandonmusic/GLM-5.3-Flash-tr3-4bpw](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw)).
 DFlash2 stays [CC BY-NC-ND 4.0](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2).
 
 ## Credits
 
 - **EXL3/TR3 weights:** [brandonmusic](https://huggingface.co/brandonmusic) —
   [GLM-5.3-Flash-tr3-4bpw](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw)
-  (uniform-K4 routed-experts, ShapleyMCG License 1.0)
+  (uniform-K4 routed-experts, ShapleyMCG License 1.0). Public mirror for this
+  recipe: [Mia-AiLab/GLM-5.3-Flash-tr3-4bpw](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-tr3-4bpw)
 - **EXL3 format / kernels:** [turboderp](https://github.com/turboderp-org/exllamav3) (ExLlamaV3)
 - **Base model:** [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)
 - **DFlash2 drafter:** [IncoAI](https://huggingface.co/incoai) —
@@ -345,4 +412,6 @@ DFlash2 stays [CC BY-NC-ND 4.0](https://huggingface.co/incoai/GLM-5.3-Flash-DFla
   (CC BY-NC-ND 4.0, research/eval)
 - **KLD panel:** [malaiwah](https://huggingface.co/malaiwah) —
   [discussion #1](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw/discussions/1#6a9144846b0bdba943bfe86f)
+- **Abliteration recipe / direction artifacts:** [drowzeys](https://huggingface.co/drowzeys) —
+  [keys-GLM-5.3-Flash-NVFP4-ablit-l15-45-anchorstock](https://huggingface.co/drowzeys/keys-GLM-5.3-Flash-NVFP4-ablit-l15-45-anchorstock)
 

@@ -3,7 +3,8 @@
 # start.sh — Spark runtime for GLM-5.3-Flash EXL3 (SM121 / GB10)
 # ============================================================================
 #
-# We serve brandonmusic/GLM-5.3-Flash-tr3-4bpw on this 2× DGX Spark (GB10 /
+# We serve Mia-AiLab/GLM-5.3-Flash-tr3-4bpw (mirror of
+# brandonmusic/GLM-5.3-Flash-tr3-4bpw @ 5ab363a8) on this 2× DGX Spark (GB10 /
 # SM121) kit: vLLM TP=2 over CX7, OpenAI API on :8888, NoPE-MLA overlay image.
 # DFlash2-7 is the default speculator. Target KV stays packed fp8_ds_mla;
 # the SM120 B12X recipe (EP2/DCP2 + nvfp4_ds_mla) is a different image/arch.
@@ -59,6 +60,10 @@ _cli_fused="${EXL3_FUSED_MOE-}"
 _cli_image="${IMAGE-}"
 _cli_util="${GPU_MEM_UTIL-}"
 _cli_lm="${LANGUAGE_MODEL_ONLY-}"
+_cli_ablit="${ABLIT-}"
+_cli_ablit_direction="${ABLIT_DIRECTION-}"
+_cli_ablit_layers="${ABLIT_LAYERS-}"
+_cli_ablit_alpha="${ABLIT_ALPHA-}"
 set -a
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/.env"
@@ -70,12 +75,21 @@ set +a
 [ -n "${_cli_image}" ] && IMAGE="$_cli_image"
 [ -n "${_cli_util}" ] && GPU_MEM_UTIL="$_cli_util"
 [ -n "${_cli_lm}" ] && LANGUAGE_MODEL_ONLY="$_cli_lm"
+[ -n "${_cli_ablit}" ] && ABLIT="$_cli_ablit"
+[ -n "${_cli_ablit_direction}" ] && ABLIT_DIRECTION="$_cli_ablit_direction"
+[ -n "${_cli_ablit_layers}" ] && ABLIT_LAYERS="$_cli_ablit_layers"
+[ -n "${_cli_ablit_alpha}" ] && ABLIT_ALPHA="$_cli_ablit_alpha"
 
 # ----------------------------- configuration -------------------------------
-MODEL="${MODEL:-brandonmusic/GLM-5.3-Flash-tr3-4bpw}"
+MODEL="${MODEL:-Mia-AiLab/GLM-5.3-Flash-tr3-4bpw}"
+# If the durable mirror is empty/moved, download.sh falls back to this id.
+MODEL_FALLBACK="${MODEL_FALLBACK:-brandonmusic/GLM-5.3-Flash-tr3-4bpw}"
 MODEL_CACHE_NAME="${MODEL_CACHE_NAME:-models--${MODEL//\//--}}"
+MODEL_FALLBACK_CACHE_NAME="${MODEL_FALLBACK_CACHE_NAME:-models--${MODEL_FALLBACK//\//--}}"
+# Hub commit on the Mia-AiLab mirror (the 5ab363a8-byte-identical upload).
+MODEL_REVISION="${MODEL_REVISION:-05ffc7e0c7ff4581af415addbf5f219e7f51590a}"
 IMAGE="${IMAGE:-ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3}"
-SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-$MODEL}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-GLM-5.3-Flash-EXL3}"
 GHCR_USER="${GHCR_USER:-MiaAI-Lab}"
 
 HEAD_IP="${HEAD_IP:-10.0.0.1}"
@@ -157,6 +171,17 @@ fi
 # 1 = fused exl3_moe (decode). 0 restores the unique-expert LinearEXL3 loop.
 EXL3_FUSED_MOE="${EXL3_FUSED_MOE:-1}"
 
+# --- abliteration (ablit/) --------------------------------------------------
+# Load-time o_proj orthogonalization (overlay/ablit_runtime.py). Published
+# recipe: layers 15-45 edited with the dealign direction, 0-14 stay stock
+# safety anchors, MTP block included. 0 = stock weights. Applied identically
+# on both TP ranks; the DFlash2 drafter is never touched.
+ABLIT="${ABLIT:-0}"
+ABLIT_DIRECTION="${ABLIT_DIRECTION:-dealign}"  # dealign | bf_oproj | /path/dir.pt
+ABLIT_LAYERS="${ABLIT_LAYERS:-15-45}"          # inclusive; 45 = checkpoint MTP block
+ABLIT_ALPHA="${ABLIT_ALPHA:-3.0}"              # 1.0 = plain projection, >1 over-projects
+ABLIT_INCLUDE_MTP="${ABLIT_INCLUDE_MTP:-1}"
+
 READY_TIMEOUT="${READY_TIMEOUT:-3600}"
 
 CONTAINER_HEAD="${CONTAINER_HEAD:-glm53-exl3-head}"
@@ -164,6 +189,7 @@ CONTAINER_WORKER="${CONTAINER_WORKER:-glm53-exl3-worker}"
 
 HF_CACHE_DIR="${HF_HOME:-$HOME/.cache/huggingface}"
 MODEL_PATH="$HF_CACHE_DIR/hub/$MODEL_CACHE_NAME"
+FALLBACK_MODEL_PATH="$HF_CACHE_DIR/hub/$MODEL_FALLBACK_CACHE_NAME"
 DFLASH_PATH="$HF_CACHE_DIR/hub/$DFLASH_CACHE_NAME"
 WORKER_CACHE_DIR="$WORKER_HOME/.cache/huggingface"
 CACHE_ROOT="${CACHE_ROOT:-$HOME/.cache/vllm-glm53-flash}"
@@ -279,6 +305,16 @@ preflight() {
     check_port_free "$PORT" PORT
     check_port_free "$MASTER_PORT" MASTER_PORT
 
+    # ablit artifacts ship into both containers on every launch — verify once
+    [ -f "$SCRIPT_DIR/ablit/LAYER_MAP.json" ] || die "$SCRIPT_DIR/ablit/LAYER_MAP.json missing — the ablit/ folder is part of this repo"
+    [ -f "$SCRIPT_DIR/ablit/refusal_direction_glm53_dealign_late.pt" ] || die "$SCRIPT_DIR/ablit/refusal_direction_glm53_dealign_late.pt missing"
+    [ -f "$SCRIPT_DIR/ablit/refusal_direction_glm53_bf_oproj.pt" ] || die "$SCRIPT_DIR/ablit/refusal_direction_glm53_bf_oproj.pt missing"
+    [ -f "$SCRIPT_DIR/overlay/ablit_runtime.py" ] || die "$SCRIPT_DIR/overlay/ablit_runtime.py missing"
+    [ -f "$SCRIPT_DIR/overlay/patch_ablit.py" ] || die "$SCRIPT_DIR/overlay/patch_ablit.py missing"
+    if [ "$ABLIT" = "1" ]; then
+        log "ablit: ON (direction=${ABLIT_DIRECTION} layers=${ABLIT_LAYERS} alpha=${ABLIT_ALPHA} mtp=${ABLIT_INCLUDE_MTP})"
+    fi
+
     local need_kb=$((180 * 1024 * 1024)) avail
     mkdir -p "$HF_CACHE_DIR"
     avail=$(df -Pk "$HF_CACHE_DIR" 2>/dev/null | awk 'NR==2{print $4}' || true)
@@ -391,38 +427,71 @@ ensure_image() {
 }
 
 # ---------------------------- weight download ------------------------------
+# Use an already-complete local tree (primary or upstream fallback). If the
+# durable Mia-AiLab mirror is still filling / 404s, keep serving from the
+# brandonmusic cache folder without a second 164 GiB pull.
+adopt_complete_weights() {
+    local have
+    have="$(count_shards "$MODEL_PATH")"
+    if [ "${have:-0}" -ge "$EXPECTED_SHARDS" ]; then
+        ensure_refs_main
+        log "weights already present: $MODEL_PATH ($have shards)"
+        return 0
+    fi
+    have="$(count_shards "$FALLBACK_MODEL_PATH")"
+    if [ "${have:-0}" -ge "$EXPECTED_SHARDS" ]; then
+        log "primary cache incomplete — using fallback ${MODEL_FALLBACK} at $FALLBACK_MODEL_PATH ($have shards)"
+        MODEL_PATH="$FALLBACK_MODEL_PATH"
+        MODEL_CACHE_NAME="$MODEL_FALLBACK_CACHE_NAME"
+        ensure_refs_main
+        return 0
+    fi
+    return 1
+}
+
+hf_download_repo() {
+    local repo="$1"
+    local hf_bin="$2"
+    shift 2
+    local -a args=("$repo")
+    if [ -n "${MODEL_REVISION:-}" ] && [ "$repo" = "$MODEL" ]; then
+        args+=(--revision "$MODEL_REVISION")
+    fi
+    args+=("$@")
+    HF_HOME="$HF_CACHE_DIR" "$hf_bin" download "${args[@]}"
+}
+
 download_weights() {
     [ "${SKIP_DOWNLOAD:-0}" = "1" ] && { log "SKIP_DOWNLOAD=1 — skipping download check"; return; }
-    local need=0 have
-    have="$(count_shards "$MODEL_PATH")"
-    if [ ! -d "$MODEL_PATH" ]; then
-        need=1
-    elif [ "${have:-0}" -lt "$EXPECTED_SHARDS" ]; then
-        need=1
-        log "weights incomplete ($have / $EXPECTED_SHARDS shards) — resuming download"
-    elif [ "${REFRESH_WEIGHTS:-0}" = "1" ]; then
-        need=1
+    if [ "${REFRESH_WEIGHTS:-0}" != "1" ] && adopt_complete_weights; then
+        return
     fi
-    [ "$need" = "0" ] && { log "weights already present: $MODEL_PATH ($have shards)"; ensure_refs_main; return; }
 
     local hf
     hf="$(command -v hf || command -v huggingface-cli || true)"
     [ -n "$hf" ] || die "neither 'hf' nor 'huggingface-cli' found — pip install --user -U 'huggingface_hub[cli]'"
 
     mkdir -p "$HF_CACHE_DIR"
-    log "downloading ${MODEL} (~164 GiB / ${EXPECTED_SHARDS} shards) into ${HF_CACHE_DIR} ..."
     local -a hf_excl=()
     local pat
     IFS=',' read -ra _excl_pats <<< "${HF_DOWNLOAD_EXCLUDE:-runtime-results/**,src/**,runtime/src/**,scripts/**,docs/**,results/**,.materialization/**,runtime/scripts/**}"
     for pat in "${_excl_pats[@]}"; do
         [ -n "$pat" ] && hf_excl+=(--exclude "$pat")
     done
-    HF_HOME="$HF_CACHE_DIR" "$hf" download "$MODEL" "${hf_excl[@]}"
-    ensure_refs_main
-    have="$(count_shards "$MODEL_PATH")"
-    [ "${have:-0}" -ge "$EXPECTED_SHARDS" ] \
-        || die "download finished with $have / $EXPECTED_SHARDS shards"
-    log "download complete ($have shards)"
+
+    log "downloading ${MODEL} (~164 GiB / ${EXPECTED_SHARDS} shards) into ${HF_CACHE_DIR} ..."
+    hf_download_repo "$MODEL" "$hf" "${hf_excl[@]}" || warn "download of ${MODEL} failed — will try ${MODEL_FALLBACK}"
+    if adopt_complete_weights; then
+        return
+    fi
+
+    if [ "$MODEL_FALLBACK" != "$MODEL" ]; then
+        log "falling back to ${MODEL_FALLBACK} ..."
+        hf_download_repo "$MODEL_FALLBACK" "$hf" "${hf_excl[@]}" \
+            || die "download of ${MODEL} and ${MODEL_FALLBACK} both failed"
+    fi
+    adopt_complete_weights \
+        || die "download finished with $(count_shards "$MODEL_PATH") / $EXPECTED_SHARDS shards"
 }
 
 download_dflash() {
@@ -557,6 +626,14 @@ fi
 if [ -f /opt/glm53/patch_glm_video_placeholders.py ]; then
     python3 /opt/glm53/patch_glm_video_placeholders.py
 fi
+if [ -f /opt/glm53/patch_ablit.py ]; then
+    python3 /opt/glm53/patch_ablit.py
+fi
+if [ "${ABLIT:-0}" = "1" ]; then
+    say "ablit: o_proj orthogonalization ON (direction=${ABLIT_DIRECTION:-dealign} layers=${ABLIT_LAYERS:-15-45} alpha=${ABLIT_ALPHA:-3.0})"
+else
+    say "ablit: off — stock o_proj weights"
+fi
 say "launching: vllm serve ${MODEL_DIR} ${ARGS[*]}"
 exec vllm serve "${MODEL_DIR}" "${ARGS[@]}"
 EOF
@@ -621,6 +698,14 @@ fi
 if [ -f /opt/glm53/patch_glm_video_placeholders.py ]; then
     python3 /opt/glm53/patch_glm_video_placeholders.py
 fi
+if [ -f /opt/glm53/patch_ablit.py ]; then
+    python3 /opt/glm53/patch_ablit.py
+fi
+if [ "${ABLIT:-0}" = "1" ]; then
+    say "ablit: o_proj orthogonalization ON (direction=${ABLIT_DIRECTION:-dealign} layers=${ABLIT_LAYERS:-15-45} alpha=${ABLIT_ALPHA:-3.0})"
+else
+    say "ablit: off — stock o_proj weights"
+fi
 say "joining TP2 at ${HEAD_IP}:${MASTER_PORT} as rank 1"
 exec vllm serve "${MODEL_DIR}" "${ARGS[@]}"
 EOF
@@ -639,6 +724,12 @@ launch_cluster() {
     scp -q -o BatchMode=yes "$CHAT_TEMPLATE_HOST" "${WORKER_SSH}:/tmp/glm53-chat_template.jinja"
     [ -f "$VIDEO_PATCH_HOST" ] || die "missing $VIDEO_PATCH_HOST"
     scp -q -o BatchMode=yes "$VIDEO_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_glm_video_placeholders.py"
+
+    # ablit artifacts + hook (read-only mounts inside both containers)
+    worker_ssh "rm -rf /tmp/glm53-ablit"
+    scp -q -r -o BatchMode=yes "$SCRIPT_DIR/ablit" "${WORKER_SSH}:/tmp/glm53-ablit"
+    scp -q -o BatchMode=yes "$SCRIPT_DIR/overlay/ablit_runtime.py" "${WORKER_SSH}:/tmp/glm53-ablit_runtime.py"
+    scp -q -o BatchMode=yes "$SCRIPT_DIR/overlay/patch_ablit.py" "${WORKER_SSH}:/tmp/patch_ablit.py"
 
     local -a nccl_common=(
         -e NCCL_IB_DISABLE=0
@@ -695,7 +786,8 @@ launch_cluster() {
              KV_CACHE_DTYPE MTP_TOKENS SPEC_METHOD DFLASH_TOKENS DFLASH_MODEL_DIR \
              DFLASH_DRAFT_TP \
              LANGUAGE_MODEL_ONLY SKIP_MM_PROFILING \
-             LIMIT_MM CHAT_TEMPLATE ENFORCE_EAGER EXL3_FUSED_MOE MODEL_DIR EXTRA_ARGS; do
+             LIMIT_MM CHAT_TEMPLATE ENFORCE_EAGER EXL3_FUSED_MOE MODEL_DIR EXTRA_ARGS \
+             ABLIT ABLIT_DIRECTION ABLIT_LAYERS ABLIT_ALPHA ABLIT_INCLUDE_MTP; do
         serve_env+=" -e $v='${!v:-}'"
     done
 
@@ -709,6 +801,9 @@ launch_cluster() {
         -v '/tmp/${CONTAINER_WORKER}.sh:/start.sh:ro' \
         -v '/tmp/glm53-chat_template.jinja:${CHAT_TEMPLATE}:ro' \
         -v '/tmp/patch_glm_video_placeholders.py:/opt/glm53/patch_glm_video_placeholders.py:ro' \
+        -v '/tmp/glm53-ablit:/opt/glm53/ablit:ro' \
+        -v '/tmp/glm53-ablit_runtime.py:/opt/glm53/ablit_runtime.py:ro' \
+        -v '/tmp/patch_ablit.py:/opt/glm53/patch_ablit.py:ro' \
         ${worker_preload} \
         ${worker_nccl} \
         -e NCCL_SOCKET_IFNAME='$WORKER_CX7_IF' \
@@ -728,6 +823,9 @@ launch_cluster() {
         -v "$HEAD_SCRIPT:/start.sh:ro" \
         -v "$CHAT_TEMPLATE_HOST:$CHAT_TEMPLATE:ro" \
         -v "$VIDEO_PATCH_HOST:/opt/glm53/patch_glm_video_placeholders.py:ro" \
+        -v "$SCRIPT_DIR/ablit:/opt/glm53/ablit:ro" \
+        -v "$SCRIPT_DIR/overlay/ablit_runtime.py:/opt/glm53/ablit_runtime.py:ro" \
+        -v "$SCRIPT_DIR/overlay/patch_ablit.py:/opt/glm53/patch_ablit.py:ro" \
         "${head_preload[@]}" \
         "${nccl_common[@]}" \
         -e NCCL_SOCKET_IFNAME="$HEAD_CX7_IF" \
@@ -752,6 +850,11 @@ launch_cluster() {
         -e CHAT_TEMPLATE="$CHAT_TEMPLATE" \
         -e ENFORCE_EAGER="$ENFORCE_EAGER" \
         -e EXL3_FUSED_MOE="$EXL3_FUSED_MOE" \
+        -e ABLIT="$ABLIT" \
+        -e ABLIT_DIRECTION="$ABLIT_DIRECTION" \
+        -e ABLIT_LAYERS="$ABLIT_LAYERS" \
+        -e ABLIT_ALPHA="$ABLIT_ALPHA" \
+        -e ABLIT_INCLUDE_MTP="$ABLIT_INCLUDE_MTP" \
         -e MODEL_DIR="$MODEL_DIR" \
         -e EXTRA_ARGS="${EXTRA_ARGS:-}" \
         --entrypoint bash "$IMAGE" /start.sh >/dev/null
@@ -815,7 +918,10 @@ on_ready() {
     local spec="MTP k=${MTP_TOKENS}"
     [ "$SPEC_METHOD" = "dflash" ] && spec="DFlash2 k=${DFLASH_TOKENS} (${DFLASH_MODEL})"
     [ "$SPEC_METHOD" = "none" ] && spec=off
+    local ablit="off (stock weights)"
+    [ "$ABLIT" = "1" ] && ablit="ON direction=${ABLIT_DIRECTION} layers=${ABLIT_LAYERS} alpha=${ABLIT_ALPHA}"
     log "  features   : tools=glm47+auto, reasoning=glm45, spec=${spec}, vision=${vision}"
+    log "  ablit      : ${ablit}"
     log "  quick test :"
     log "    curl -s http://127.0.0.1:${PORT}/v1/chat/completions \\"
     log "      -H 'Content-Type: application/json' \\"
@@ -846,7 +952,7 @@ start() {
         log "DFlash2 load path (in-container): ${DFLASH_MODEL_DIR}"
     fi
     log "model load path (in-container): ${MODEL_DIR}"
-    log "config: image=${IMAGE} tp=${TP} nnodes=${NNODES} quant=${QUANTIZATION} spec=${SPEC_METHOD} mtp=${MTP_TOKENS} dflash_k=${DFLASH_TOKENS} max-len=${MAX_MODEL_LEN} gpu-util=${GPU_MEM_UTIL} kv=${KV_CACHE_DTYPE} lm-only=${LANGUAGE_MODEL_ONLY} port=${PORT}"
+    log "config: image=${IMAGE} tp=${TP} nnodes=${NNODES} quant=${QUANTIZATION} spec=${SPEC_METHOD} mtp=${MTP_TOKENS} dflash_k=${DFLASH_TOKENS} max-len=${MAX_MODEL_LEN} gpu-util=${GPU_MEM_UTIL} kv=${KV_CACHE_DTYPE} lm-only=${LANGUAGE_MODEL_ONLY} ablit=${ABLIT} port=${PORT}"
 
     launch_cluster
     if wait_for_health; then

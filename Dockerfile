@@ -440,9 +440,17 @@ COPY overlay/patch_glm5_drafter_group.py /opt/glm53/patch_glm5_drafter_group.py
 COPY tests/test_exl3_overlay.py /opt/glm53/test_exl3_overlay.py
 COPY files/chat_template.jinja /opt/glm53/chat_template.jinja
 COPY overlay/patch_glm_video_placeholders.py /opt/glm53/patch_glm_video_placeholders.py
+# ABLIT (o_proj refusal-direction orthogonalization): artifacts + runtime hook.
+# Inert unless ABLIT=1 is set at serve time.
+COPY ablit /opt/glm53/ablit
+COPY overlay/ablit_runtime.py /opt/glm53/ablit_runtime.py
+COPY overlay/patch_ablit.py /opt/glm53/patch_ablit.py
+COPY tests/test_ablit.py /opt/glm53/test_ablit.py
 RUN python3 /opt/glm53/patch_model_overrides.py
 RUN python3 /opt/glm53/patch_dflash2.py
 RUN python3 /opt/glm53/patch_glm_eagle3.py
 RUN python3 /opt/glm53/patch_glm5_drafter_group.py
+RUN python3 /opt/glm53/patch_ablit.py
 
-RUN EXL3_SELFCHECK_GPU=0 python3 /opt/glm53/test_exl3_overlay.py
+RUN EXL3_SELFCHECK_GPU=0 python3 /opt/glm53/test_exl3_overlay.py \
+    && python3 /opt/glm53/test_ablit.py
