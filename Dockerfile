@@ -446,11 +446,15 @@ COPY ablit /opt/glm53/ablit
 COPY overlay/ablit_runtime.py /opt/glm53/ablit_runtime.py
 COPY overlay/patch_ablit.py /opt/glm53/patch_ablit.py
 COPY tests/test_ablit.py /opt/glm53/test_ablit.py
+COPY overlay/patch_suppress_stops_in_reasoning.py /opt/glm53/patch_suppress_stops_in_reasoning.py
+COPY tests/test_suppress_stops.py /opt/glm53/test_suppress_stops.py
 RUN python3 /opt/glm53/patch_model_overrides.py
 RUN python3 /opt/glm53/patch_dflash2.py
 RUN python3 /opt/glm53/patch_glm_eagle3.py
 RUN python3 /opt/glm53/patch_glm5_drafter_group.py
 RUN python3 /opt/glm53/patch_ablit.py
+RUN python3 /opt/glm53/patch_suppress_stops_in_reasoning.py
 
 RUN EXL3_SELFCHECK_GPU=0 python3 /opt/glm53/test_exl3_overlay.py \
-    && python3 /opt/glm53/test_ablit.py
+    && python3 /opt/glm53/test_ablit.py \
+    && python3 /opt/glm53/test_suppress_stops.py
