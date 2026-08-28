@@ -301,6 +301,27 @@ Mixed OS accounts: set `WORKER_USER` (this kit uses `zurih` on spark2).
 NCCL cannot use the `10.0.0.x` loopback aliases — leave the CX7 pins unless
 your cabling differs. `ncclCommInitRank` hangs without them.
 
+## Running on a different 2×Spark kit
+
+Independently reproduced on a second GB10 pair (2026-08-28) — decode within the
+same bands (structured 38–62, prose 27.1) after three kit-specific adjustments
+that are now documented/enforced:
+
+- **NIC names differ per kit.** Set all four of `HEAD_CX7_IF/IB`,
+  `WORKER_CX7_IF/IB` in `.env` (some pairs use the same names on both nodes,
+  e.g. `enP2p1s0f1np1`/`roceP2p1s0f1`). Exporting generic
+  `NCCL_SOCKET_IFNAME`/`NCCL_IB_HCA` does **not** override the per-node values.
+- **`NCCL_IB_GID_INDEX` (default 3) may be an all-zero entry on one node** —
+  the launch then dies ~60 s in with `ibv_modify_qp` errno 61 on the worker
+  rank. `preflight` now validates the index on both devices and prints both
+  GID tables when it refuses; pick the index carrying the `::ffff:<ip>`
+  RoCEv2 entry on both nodes.
+- **`GPU_MEM_UTIL=0.87` needs ≥105.9 GiB free *after* vLLM's own ~9 GiB
+  init.** Nodes running resident services (dashboards, TTS, desktop) can miss
+  it by well under 1 GiB and fail the startup memory check; `GPU_MEM_UTIL=0.86`
+  with `MAX_MODEL_LEN=800000` (the previously published pair) fits with margin.
+  If :8888 is taken on your head node, `PORT` moves the API cleanly.
+
 ## .env
 
 | Knob | Default | What |

@@ -297,6 +297,26 @@ preflight() {
     worker_ssh "nvidia-smi -L 2>/dev/null | grep -q GB10" \
         || warn "no GB10 GPU visible on worker"
 
+    # NCCL_IB_GID_INDEX must name a populated GID on BOTH nodes' CX7 devices.
+    # An empty (all-zero) entry passes every earlier check and then kills the
+    # worker rank ~60 s in with ibv_modify_qp errno 61 "No data available" —
+    # kits differ: on some GB10 pairs gid 3 is populated on one node and
+    # all-zero on the other. Fail here, in seconds, with the fix in hand.
+    local gid_head gid_worker gid_path
+    gid_path="/sys/class/infiniband/${HEAD_CX7_IB}/ports/1/gids/${NCCL_IB_GID_INDEX}"
+    gid_head=$(cat "$gid_path" 2>/dev/null | tr -d ':0' || true)
+    gid_path="/sys/class/infiniband/${WORKER_CX7_IB}/ports/1/gids/${NCCL_IB_GID_INDEX}"
+    gid_worker=$(worker_ssh "cat '$gid_path' 2>/dev/null" | tr -d ':0' || true)
+    if [ -z "$gid_head" ] || [ -z "$gid_worker" ]; then
+        warn "NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX} is EMPTY on $( [ -z "$gid_head" ] && echo "head(${HEAD_CX7_IB})" ) $( [ -z "$gid_worker" ] && echo "worker(${WORKER_CX7_IB})" )"
+        warn "GID tables (pick an index whose entry is non-zero on BOTH nodes — the ::ffff:<ip> RoCEv2 one):"
+        for i in 0 1 2 3; do
+            printf '    head   gid%s: %s\n' "$i" "$(cat "/sys/class/infiniband/${HEAD_CX7_IB}/ports/1/gids/$i" 2>/dev/null)" >&2
+        done
+        worker_ssh "for i in 0 1 2 3; do printf '    worker gid%s: %s\n' \"\$i\" \"\$(cat /sys/class/infiniband/${WORKER_CX7_IB}/ports/1/gids/\$i 2>/dev/null)\"; done" >&2 || true
+        die "set NCCL_IB_GID_INDEX in .env to a populated index (this kills the worker rank with ibv_modify_qp errno 61 otherwise)"
+    fi
+
     [ "$TP" = "2" ] || warn "TP=${TP} on a 2×1-GPU cluster — expected TP=2"
     [ "$NNODES" = "2" ] || warn "NNODES=${NNODES} — expected 2"
 
