@@ -12,7 +12,8 @@ OpenAI-compatible vLLM serve of
 **[brandonmusic/GLM-5.3-Flash-tr3-4bpw](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw)**
 (uniform-K4 EXL3/TR3 routed-experts, 4 bpw, ~164 GiB, 120 shards) on a **2× NVIDIA GB10**
 kit: tensor-parallel size 2 over CX7, native `sm_121a` cubins, API on `:8888`.
-Served model id: **`GLM-5.3-Flash-ELX3`**.
+Served model id: **`GLM-5.3-Flash-ELX3`**. EXL3/TR3 quant by
+[brandonmusic](https://huggingface.co/brandonmusic).
 
 This is **EXL3 weights + fp8 KV** on GB10. Do not pass `--moe-backend marlin`.
 The Hub card's TP2/EP2/DCP2 + calibrated NVFP4 MLA KV recipe is the SM120 B12X
@@ -279,3 +280,15 @@ Image-build runs `EXL3_SELFCHECK_GPU=0`. `./start.sh` runs the GPU self-check
 - `"attention_backend": "TRITON_ATTN"` in speculative-config (causal-in-block on this image)
 - Change TP, CX7 pins, or `USE_HOST_NCCL` unless you are re-plumbing NCCL
 - Force-push
+
+## Credits
+
+- **EXL3/TR3 weights:** [brandonmusic](https://huggingface.co/brandonmusic) —
+  [GLM-5.3-Flash-tr3-4bpw](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw)
+  (uniform-K4 routed-experts, ShapleyMCG License 1.0)
+- **EXL3 format / kernels:** [turboderp](https://github.com/turboderp-org/exllamav3) (ExLlamaV3)
+- **Base model:** [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)
+- **DFlash2 drafter:** [IncoAI](https://huggingface.co/incoai) —
+  [GLM-5.3-Flash-DFlash2](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2)
+  (CC BY-NC-ND 4.0, research/eval)
+
