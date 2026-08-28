@@ -25,7 +25,8 @@
 #   4. sync       — rsync that cache to the worker (each rank loads local disk)
 #   5. launch     — worker --headless, then head + `vllm serve` (both
 #                   --network host --ipc=host)
-#   6. wait       — poll /health up to READY_TIMEOUT
+#   6. wait       — poll /health up to READY_TIMEOUT, then a nonfatal
+#                   DFlash2/sampler shape warmup (GLM53_BOOT_SHAPE_WARMUP)
 #
 # Usage:
 #   ./start.sh                    start (download/sync/launch) — default
@@ -186,6 +187,12 @@ ABLIT_INCLUDE_MTP="${ABLIT_INCLUDE_MTP:-1}"
 READY_TIMEOUT="${READY_TIMEOUT:-3600}"
 # 1 = suppress client stop strings until </think> (DSpark #42 class).
 GLM53_SUPPRESS_STOPS_IN_REASONING="${GLM53_SUPPRESS_STOPS_IN_REASONING:-1}"
+# EngineCore stock timeout is 300s; mid-serve Triton/TileLang JIT on TP=2 can
+# exceed that without being a true hang. NCCL watchdog is still 600s.
+VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}"
+# 1 = after /health, burn DFlash2 BLOCK / sampler / kpool shapes. Nonfatal.
+GLM53_BOOT_SHAPE_WARMUP="${GLM53_BOOT_SHAPE_WARMUP:-1}"
+GLM53_WARMUP_REQ_TIMEOUT="${GLM53_WARMUP_REQ_TIMEOUT:-240}"
 
 CONTAINER_HEAD="${CONTAINER_HEAD:-glm53-exl3-head}"
 CONTAINER_WORKER="${CONTAINER_WORKER:-glm53-exl3-worker}"
@@ -197,6 +204,14 @@ DFLASH_PATH="$HF_CACHE_DIR/hub/$DFLASH_CACHE_NAME"
 WORKER_CACHE_DIR="$WORKER_HOME/.cache/huggingface"
 CACHE_ROOT="${CACHE_ROOT:-$HOME/.cache/vllm-glm53-flash}"
 WORKER_VLLM_CACHE="${WORKER_VLLM_CACHE:-$WORKER_HOME/.cache/vllm-glm53-flash}"
+# Overlay FS ~/.triton and ~/.tilelang die on container recreate (TP=2 JIT
+# stall → 600s NCCL watchdog). Persist next to the vLLM cache.
+TRITON_HOST_CACHE="${TRITON_HOST_CACHE:-$CACHE_ROOT/triton}"
+TILELANG_HOST_CACHE="${TILELANG_HOST_CACHE:-$CACHE_ROOT/tilelang}"
+WORKER_TRITON_CACHE="${WORKER_TRITON_CACHE:-$WORKER_VLLM_CACHE/triton}"
+WORKER_TILELANG_CACHE="${WORKER_TILELANG_CACHE:-$WORKER_VLLM_CACHE/tilelang}"
+TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/root/.triton/cache}"
+TILELANG_CACHE_DIR="${TILELANG_CACHE_DIR:-/root/.tilelang/cache}"
 
 LOGDIR="$SCRIPT_DIR/logs"
 HEAD_SCRIPT="$SCRIPT_DIR/.glm53-exl3-head.inner.sh"
@@ -727,8 +742,8 @@ launch_cluster() {
     docker rm -f "$CONTAINER_HEAD" >/dev/null 2>&1 || true
     worker_ssh "docker rm -f '$CONTAINER_WORKER'" >/dev/null 2>&1 || true
 
-    mkdir -p "$CACHE_ROOT"
-    worker_ssh "mkdir -p '$WORKER_VLLM_CACHE'"
+    mkdir -p "$CACHE_ROOT" "$TRITON_HOST_CACHE" "$TILELANG_HOST_CACHE"
+    worker_ssh "mkdir -p '$WORKER_VLLM_CACHE' '$WORKER_TRITON_CACHE' '$WORKER_TILELANG_CACHE'"
     scp -q -o BatchMode=yes "$WORKER_SCRIPT" "${WORKER_SSH}:/tmp/${CONTAINER_WORKER}.sh"
     [ -f "$CHAT_TEMPLATE_HOST" ] || die "missing chat template: $CHAT_TEMPLATE_HOST"
     scp -q -o BatchMode=yes "$CHAT_TEMPLATE_HOST" "${WORKER_SSH}:/tmp/glm53-chat_template.jinja"
@@ -760,6 +775,9 @@ launch_cluster() {
         -e HF_HOME=/root/.cache/huggingface
         -e VLLM_CACHE_ROOT=/root/.cache/vllm
         -e "GLM53_SUPPRESS_STOPS_IN_REASONING=$GLM53_SUPPRESS_STOPS_IN_REASONING"
+        -e "TRITON_CACHE_DIR=$TRITON_CACHE_DIR"
+        -e "TILELANG_CACHE_DIR=$TILELANG_CACHE_DIR"
+        -e "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=$VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS"
         -e "TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST"
         -e "FLASHINFER_CUDA_ARCH_LIST=$FLASHINFER_CUDA_ARCH_LIST"
         -e FLASHINFER_DISABLE_VERSION_CHECK=1
@@ -811,6 +829,8 @@ launch_cluster() {
         --ulimit memlock=-1 --ulimit stack=67108864 \
         -v '$WORKER_CACHE_DIR:/root/.cache/huggingface' \
         -v '$WORKER_VLLM_CACHE:/root/.cache/vllm' \
+        -v '$WORKER_TRITON_CACHE:/root/.triton/cache' \
+        -v '$WORKER_TILELANG_CACHE:/root/.tilelang/cache' \
         -v '/tmp/${CONTAINER_WORKER}.sh:/start.sh:ro' \
         -v '/tmp/glm53-chat_template.jinja:${CHAT_TEMPLATE}:ro' \
         -v '/tmp/patch_glm_video_placeholders.py:/opt/glm53/patch_glm_video_placeholders.py:ro' \
@@ -834,6 +854,8 @@ launch_cluster() {
         --ulimit memlock=-1 --ulimit stack=67108864 \
         -v "$HF_CACHE_DIR:/root/.cache/huggingface" \
         -v "$CACHE_ROOT:/root/.cache/vllm" \
+        -v "$TRITON_HOST_CACHE:/root/.triton/cache" \
+        -v "$TILELANG_HOST_CACHE:/root/.tilelang/cache" \
         -v "$HEAD_SCRIPT:/start.sh:ro" \
         -v "$CHAT_TEMPLATE_HOST:$CHAT_TEMPLATE:ro" \
         -v "$VIDEO_PATCH_HOST:/opt/glm53/patch_glm_video_placeholders.py:ro" \
@@ -916,6 +938,24 @@ wait_for_health() {
     [ "$healthy" = "1" ]
 }
 
+post_ready_warmup() {
+    if [ "${GLM53_BOOT_SHAPE_WARMUP:-1}" = "0" ]; then
+        log "boot shape warmup skipped (GLM53_BOOT_SHAPE_WARMUP=0)"
+        return 0
+    fi
+    [ -f "$SCRIPT_DIR/scripts/boot-shape-warmup.sh" ] \
+        || { warn "boot-shape-warmup.sh missing — skipping"; return 0; }
+    log "post-ready DFlash2/sampler warmup (nonfatal; timeout ${GLM53_WARMUP_REQ_TIMEOUT}s/req) ..."
+    GLM53_WARMUP_MAX_CONCURRENCY="$MAX_NUM_SEQS" \
+    GLM53_WARMUP_REQ_TIMEOUT="$GLM53_WARMUP_REQ_TIMEOUT" \
+    GLM53_WARMUP_DFLASH_K="${DFLASH_TOKENS:-7}" \
+    GLM53_WARMUP_TRITON_CACHE_DIR="$TRITON_HOST_CACHE" \
+    GLM53_WARMUP_BEARER="${VLLM_API_KEY:-}" \
+        bash "$SCRIPT_DIR/scripts/boot-shape-warmup.sh" \
+            "http://127.0.0.1:${PORT}" "$SERVED_MODEL_NAME" \
+        || warn "boot shape warmup incomplete — uncovered shapes may JIT mid-serve on TP=2"
+}
+
 collect_failure_logs() {
     mkdir -p "$LOGDIR"
     docker logs "$CONTAINER_HEAD" >"$LOGDIR/head.log" 2>&1 || true
@@ -971,6 +1011,7 @@ start() {
 
     launch_cluster
     if wait_for_health; then
+        post_ready_warmup
         on_ready
         return
     fi
