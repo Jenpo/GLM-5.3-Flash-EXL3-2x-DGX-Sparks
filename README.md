@@ -26,6 +26,10 @@ stays packed **`fp8_ds_mla`**. Speculator is **DFlash2 k=7**
 draft attention is **FLASH_ATTN** (do not pin `TRITON_ATTN` — that mask is causal
 inside the draft block on this image and collapses later-position accept).
 
+Optional ABLIT (`ABLIT=1` o_proj refusal edit) lives on the
+[`ablit`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/tree/ablit)
+branch, not on `main`.
+
 ## Decode (this kit, 2026-08-28)
 
 Official numbers: sparkDash Decode bench, DFlash2 k=7, **Structured** (count 1→200) and **Code** (`clamp_00`…`clamp_49`) — same high-accept regime. Temp **0**, thinking **off**, 400 tokens, CUDA graphs, fused EXL3 MoE. Prompt types, not grammar / schema. Stream tok/s is per request; aggregate is all streams.
@@ -168,60 +172,6 @@ After talking in B, A’s prefix was gone. Concurrent A+B: only one session hit.
 Idle chats are not reserved in the pool. Expect prefill on later turns of an
 old window; only the next turn of a still-hashed, block-aligned prefix skips
 part of it.
-
-## Abliteration (`ABLIT=1`)
-
-Optional refusal-direction ablation, applied at weight-load time on top of the
-EXL3 checkpoint — nothing is requantized or rewritten on disk. Artifacts live
-in `ablit/` (two ~18 KB fp32 direction vectors + `LAYER_MAP.json`) and come
-from
-[drowzeys/keys-GLM-5.3-Flash-NVFP4-ablit-l15-45-anchorstock](https://huggingface.co/drowzeys/keys-GLM-5.3-Flash-NVFP4-ablit-l15-45-anchorstock).
-The published recipe is **dealign-oproj-transplant**: every `self_attn.o_proj`
-in layers **15–45** is orthogonalized against the refusal direction, layers
-**0–14 stay stock** as safety anchors (keeps coherence while dropping
-refusals), and the checkpoint MTP block (layer 45) is included.
-
-The edit per o_proj (`W: [4096, in]`, `r`: fp32 direction, ‖r‖=1):
-
-```text
-W' = (I - alpha * r rᵀ) W      # default ABLIT_ALPHA=3.0 (alpha_ref)
-```
-
-Output components orthogonal to `r` are preserved exactly; the component
-along `r` is scaled by `1 − alpha` (alpha 3 inverts it — stronger
-over-projection; set `ABLIT_ALPHA=1.0` for the plain projection that zeroes
-it). Since o_proj is native BF16 here and `RowParallelLinear` shards only the
-input dim, the row-space edit is identical on both TP ranks with no
-collectives. Applied by `overlay/ablit_runtime.py`, installed by
-`overlay/patch_ablit.py` at the end of `Glm5NextModel.load_weights` /
-`Glm5NextMTP.load_weights` — before CUDA-graph capture, after the loaders are
-done. The DFlash2 drafter is never touched.
-
-Enable:
-
-```bash
-ABLIT=1 ./start.sh restart          # or set ABLIT=1 in .env, then ./start.sh restart
-./start.sh logs | grep ablit        # "orthogonalized layers.15.self_attn.o_proj …" per rank
-```
-
-Disable the same way (`ABLIT=0` / unset → hook is a no-op, stock weights).
-No rebuild: the artifacts + hook are bind-mounted into both containers on
-every `./start.sh`, so prebuilt GHCR images work too.
-
-| Knob | Default | What |
-|---|---|---|
-| `ABLIT` | `0` | `1` = apply the o_proj orthogonalization at load (both ranks) |
-| `ABLIT_DIRECTION` | `dealign` | `dealign` (published recipe) \| `bf_oproj` (blackfrost direction, `alpha_ref` 3.0) \| absolute path to a custom direction `.pt` |
-| `ABLIT_LAYERS` | `15-45` | inclusive range; `45` is the checkpoint MTP block |
-| `ABLIT_ALPHA` | `3.0` | projection scale. `1.0` = plain projection, >1 over-projects |
-| `ABLIT_INCLUDE_MTP` | `1` | also edit the MTP block's o_proj when it loads (`SPEC_METHOD=mtp`) |
-
-Caveats: the KLD quality panel above was measured **without** ablit; expect a
-refusal-behavior change and re-tune `ABLIT_ALPHA` if coherence degrades
-(lower it first). DFlash2 acceptance rates can shift a little (the drafter is
-stock while the target's outputs change). Provenance is the NVFP4 ablit
-checkpoint, but only the **direction vectors** are used here — the EXL3
-serve keeps its own weights, and o_proj is unquantized in both.
 
 ## Quick start (2× Spark)
 
@@ -375,12 +325,8 @@ this Dockerfile instead. After CUDA compile, Python overlay edits
 | `overlay/patch_glm_eagle3.py` | Glm5Next EAGLE3 aux-hidden layers (mHC `hc_post` + contract) |
 | `overlay/patch_glm5_drafter_group.py` | keep GLM KV fast path; DFlash2 SWA slot-shares MLA pages (no padding) |
 | `overlay/patch_glm_video_placeholders.py` | align video timestamp blocks to encoder `grid_t` |
-| `overlay/ablit_runtime.py` | ABLIT: o_proj refusal-direction orthogonalization at load (`ABLIT=1`) |
-| `overlay/patch_ablit.py` | install the ABLIT hook into `Glm5NextModel` / `Glm5NextMTP` load (idempotent) |
 | `overlay/patch_suppress_stops_in_reasoning.py` | fail-closed detokenizer guard: client `stop` dormant until `</think>` |
 | `scripts/boot-shape-warmup.sh` | post-`/health` DFlash2 k=7 BLOCK ladder + sampler/kpool arms |
-| `ablit/` | direction vectors + `LAYER_MAP.json` from drowzeys' published ablit recipe |
-| `tests/test_ablit.py` | recipe integrity, orthogonalization math, TP-shard equivalence, hook gating |
 
 Image-build runs `EXL3_SELFCHECK_GPU=0`. `./start.sh` runs the GPU self-check
 (`docker run --gpus all`) before shipping unless `SKIP_OVERLAY_VERIFY=1`.
@@ -392,7 +338,6 @@ Image-build runs `EXL3_SELFCHECK_GPU=0`. `./start.sh` runs the GPU self-check
 - qemu / amd64 / `cstechdev/vllm:glm53-flash-nope-sm120-*` / verdictai SM120 B12X
 - `--kv-cache-dtype nvfp4` or bf16 (no sparse-MLA kernel)
 - `"attention_backend": "TRITON_ATTN"` in speculative-config (causal-in-block on this image)
-- Point `ABLIT_DIRECTION` at another checkpoint's direction without checking `hidden_size`, or commit edits to the `.pt` artifacts
 - Change TP, CX7 pins, or `USE_HOST_NCCL` unless you are re-plumbing NCCL
 - Force-push
 
@@ -417,6 +362,4 @@ DFlash2 stays [CC BY-NC-ND 4.0](https://huggingface.co/incoai/GLM-5.3-Flash-DFla
   (CC BY-NC-ND 4.0, research/eval)
 - **KLD panel:** [malaiwah](https://huggingface.co/malaiwah) —
   [discussion #1](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw/discussions/1#6a9144846b0bdba943bfe86f)
-- **Abliteration recipe / direction artifacts:** [drowzeys](https://huggingface.co/drowzeys) —
-  [keys-GLM-5.3-Flash-NVFP4-ablit-l15-45-anchorstock](https://huggingface.co/drowzeys/keys-GLM-5.3-Flash-NVFP4-ablit-l15-45-anchorstock)
 
