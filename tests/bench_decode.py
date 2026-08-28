@@ -17,12 +17,19 @@ import urllib.request
 from pathlib import Path
 
 BASE = "http://127.0.0.1:8888"
-MODEL = "brandonmusic/GLM-5.3-Flash-EXL3-4bpw"
+MODEL = "GLM-5.3-Flash-ELX3"
 BENCH_PROMPT = (
     "Write a detailed step-by-step explanation of how a hash map works, "
     "including collision handling, resizing, and time complexity. Be thorough."
 )
+# Same regime as tonyd2wild's 60.6 tok/s re-bench (temp 0, thinking off, warmed).
+STRUCTURED_PROMPT = (
+    "Count from 1 to 200. Output only the numbers, separated by spaces. No other text."
+)
 NAN_RE = re.compile(r"\bnan\b|locklock", re.I)
+SPEC_RE = re.compile(
+    r"^(vllm:spec_decode_[a-zA-Z0-9_]+)\{([^}]*)\}\s+(\S+)$"
+)
 
 
 def _post(path: str, body: dict, timeout: float = 600.0, stream: bool = False):
@@ -61,11 +68,59 @@ def chat_nonstream(prompt: str, max_tokens: int = 64) -> dict:
         return data
 
 
-def stream_bench(max_tokens: int = 200) -> dict:
+def spec_snapshot() -> dict[str, float]:
+    """vLLM spec-decode counters. per-pos keys are pos:{n}."""
+    req = urllib.request.Request(BASE + "/metrics")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        raw = resp.read().decode("utf-8", "replace")
+    out: dict[str, float] = {}
+    for line in raw.splitlines():
+        m = SPEC_RE.match(line)
+        if not m:
+            continue
+        name, labels, val = m.group(1), m.group(2), float(m.group(3))
+        if name.endswith("_created"):
+            continue
+        if "per_pos" in name:
+            pos = re.search(r'position="(\d+)"', labels)
+            if pos:
+                out[f"pos:{pos.group(1)}"] = val
+        else:
+            out[name] = out.get(name, 0.0) + val
+    return out
+
+
+def spec_delta(before: dict[str, float], after: dict[str, float]) -> dict:
+    drafts = after.get("vllm:spec_decode_num_drafts_total", 0) - before.get(
+        "vllm:spec_decode_num_drafts_total", 0
+    )
+    draft_tok = after.get("vllm:spec_decode_num_draft_tokens_total", 0) - before.get(
+        "vllm:spec_decode_num_draft_tokens_total", 0
+    )
+    acc = after.get("vllm:spec_decode_num_accepted_tokens_total", 0) - before.get(
+        "vllm:spec_decode_num_accepted_tokens_total", 0
+    )
+    pos = []
+    for i in range(7):
+        k = f"pos:{i}"
+        d = after.get(k, 0) - before.get(k, 0)
+        pos.append(round(d / drafts, 4) if drafts else 0.0)
+    return {
+        "drafts": int(drafts),
+        "draft_tokens": int(draft_tok),
+        "accepted": int(acc),
+        "accept_ratio": round(acc / draft_tok, 4) if draft_tok else None,
+        "accepted_per_step": round(acc / drafts, 3) if drafts else None,
+        "pos": pos,
+    }
+
+
+def stream_bench(max_tokens: int = 200, prompt: str | None = None) -> dict:
     body = {
         "model": MODEL,
-        "messages": [{"role": "user", "content": BENCH_PROMPT}],
+        "messages": [{"role": "user", "content": prompt or BENCH_PROMPT}],
         "temperature": 0,
+        "top_p": 1,
         "max_tokens": max_tokens,
         "stream": True,
         "stream_options": {"include_usage": True},
@@ -186,6 +241,11 @@ def main() -> int:
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--max-tokens", type=int, default=200)
     ap.add_argument("--skip-coherence", action="store_true")
+    ap.add_argument(
+        "--structured",
+        action="store_true",
+        help="Warmed count-1-to-200 decode (temp 0, thinking off). Reports median tok/s + DFlash2 accept.",
+    )
     args = ap.parse_args()
     h_code, h_body = health()
     rec: dict = {
@@ -199,14 +259,46 @@ def main() -> int:
         Path(args.out).write_text(json.dumps(rec, indent=2))
         print(json.dumps(rec, indent=2))
         return 2
+    prompt = STRUCTURED_PROMPT if args.structured else BENCH_PROMPT
+    rec["prompt"] = "structured-count-1-200" if args.structured else "hashmap-prose"
+    rec["thinking"] = False
+    rec["temperature"] = 0
+    if args.structured:
+        print("[bench] warmup (32 tokens)", flush=True)
+        warm = stream_bench(32, prompt=prompt)
+        rec["warmup"] = {k: warm[k] for k in ("tok_s", "ttft_s", "completion_tokens")}
+        print(json.dumps(rec["warmup"]), flush=True)
+        args.skip_coherence = True
     for i in range(args.runs):
         print(f"[bench] run {i+1}/{args.runs} phase={args.phase}", flush=True)
-        r = stream_bench(args.max_tokens)
+        before = spec_snapshot()
+        r = stream_bench(args.max_tokens, prompt=prompt)
+        r["spec"] = spec_delta(before, spec_snapshot())
         rec["runs"].append(r)
-        print(json.dumps({k: r[k] for k in ("tok_s", "ttft_s", "completion_tokens", "finish_reason", "nan")}), flush=True)
+        print(
+            json.dumps(
+                {
+                    "tok_s": r["tok_s"],
+                    "ttft_s": r["ttft_s"],
+                    "completion_tokens": r["completion_tokens"],
+                    "finish_reason": r["finish_reason"],
+                    "nan": r["nan"],
+                    **{k: r["spec"][k] for k in ("accept_ratio", "accepted_per_step", "pos")},
+                }
+            ),
+            flush=True,
+        )
     rec["tok_s_median"] = median([r["tok_s"] for r in rec["runs"]])
+    rec["tok_s_min"] = min((r["tok_s"] for r in rec["runs"] if r["tok_s"] is not None), default=None)
+    rec["tok_s_max"] = max((r["tok_s"] for r in rec["runs"] if r["tok_s"] is not None), default=None)
     rec["ttft_median_s"] = median([r["ttft_s"] for r in rec["runs"]])
     rec["completion_tokens_median"] = median([float(r["completion_tokens"]) for r in rec["runs"]])
+    rec["accept_ratio_median"] = median(
+        [r.get("spec", {}).get("accept_ratio") for r in rec["runs"]]
+    )
+    rec["accepted_per_step_median"] = median(
+        [r.get("spec", {}).get("accepted_per_step") for r in rec["runs"]]
+    )
     rec["any_nan"] = any(r["nan"] for r in rec["runs"])
     if not args.skip_coherence:
         print("[bench] coherence", flush=True)

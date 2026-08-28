@@ -3,8 +3,10 @@
 # start.sh — Spark runtime for GLM-5.3-Flash EXL3 (SM121 / GB10)
 # ============================================================================
 #
-# We serve brandonmusic/GLM-5.3-Flash-EXL3-4bpw on this 2× DGX Spark (GB10 /
+# We serve brandonmusic/GLM-5.3-Flash-tr3-4bpw on this 2× DGX Spark (GB10 /
 # SM121) kit: vLLM TP=2 over CX7, OpenAI API on :8888, NoPE-MLA overlay image.
+# DFlash2-7 is the default speculator. Target KV stays packed fp8_ds_mla;
+# the SM120 B12X recipe (EP2/DCP2 + nvfp4_ds_mla) is a different image/arch.
 #
 #   head   : this machine (HEAD_IP, default 10.0.0.1) — vLLM rank 0 + API
 #   worker : WORKER_USER@WORKER_IP (default: $USER@10.0.0.2) — vLLM rank 1, --headless
@@ -17,7 +19,7 @@
 #   2. image      — docker pull IMAGE from GHCR if missing; ship to the
 #                   worker with docker save | ssh docker load. BUILD=1
 #                   rebuilds the overlay from this repo instead.
-#   3. download   — EXL3 weights into the local HF cache if missing (~164 GiB)
+#   3. download   — EXL3/TR3 weights into the local HF cache if missing (~164 GiB)
 #   4. sync       — rsync that cache to the worker (each rank loads local disk)
 #   5. launch     — worker --headless, then head + `vllm serve` (both
 #                   --network host --ipc=host)
@@ -48,6 +50,7 @@ if [ ! -f "$SCRIPT_DIR/.env" ]; then
 fi
 # Caller exports (MTP_TOKENS=2 ./start.sh restart) must win over .env.
 _cli_mtp="${MTP_TOKENS-}"
+_cli_spec="${SPEC_METHOD-}"
 _cli_eager="${ENFORCE_EAGER-}"
 _cli_fused="${EXL3_FUSED_MOE-}"
 _cli_image="${IMAGE-}"
@@ -58,6 +61,7 @@ set -a
 source "$SCRIPT_DIR/.env"
 set +a
 [ -n "${_cli_mtp}" ] && MTP_TOKENS="$_cli_mtp"
+[ -n "${_cli_spec}" ] && SPEC_METHOD="$_cli_spec"
 [ -n "${_cli_eager}" ] && ENFORCE_EAGER="$_cli_eager"
 [ -n "${_cli_fused}" ] && EXL3_FUSED_MOE="$_cli_fused"
 [ -n "${_cli_image}" ] && IMAGE="$_cli_image"
@@ -65,7 +69,7 @@ set +a
 [ -n "${_cli_lm}" ] && LANGUAGE_MODEL_ONLY="$_cli_lm"
 
 # ----------------------------- configuration -------------------------------
-MODEL="${MODEL:-brandonmusic/GLM-5.3-Flash-EXL3-4bpw}"
+MODEL="${MODEL:-brandonmusic/GLM-5.3-Flash-tr3-4bpw}"
 MODEL_CACHE_NAME="${MODEL_CACHE_NAME:-models--${MODEL//\//--}}"
 IMAGE="${IMAGE:-ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-$MODEL}"
@@ -103,8 +107,18 @@ PORT="${PORT:-8888}"
 MASTER_PORT="${MASTER_PORT:-29521}"
 
 MTP_TOKENS="${MTP_TOKENS:-2}"
+# dflash (default, incoai/GLM-5.3-Flash-DFlash2, k=7) | mtp | none
+SPEC_METHOD="${SPEC_METHOD:-dflash}"
+DFLASH_MODEL="${DFLASH_MODEL:-incoai/GLM-5.3-Flash-DFlash2}"
+DFLASH_CACHE_NAME="${DFLASH_CACHE_NAME:-models--${DFLASH_MODEL//\//--}}"
+DFLASH_TOKENS="${DFLASH_TOKENS:-7}"
+# 1 = keep the ~2.3 GiB drafter on rank 0 (no CX7 on every draft step).
+# Empty = inherit target TP. Do not pin attention_backend: SM121 already
+# prefers FLASH_ATTN for non-causal dense SWA. TRITON_ATTN was an SM120
+# mask-fix copy this image does not have.
+DFLASH_DRAFT_TP="${DFLASH_DRAFT_TP-1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-1048576}"
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.875}"
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.86}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
 # 8192 chunk × long history oversubscribes GB10 persistent_topk smem (300k crash).
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-1024}"
@@ -122,12 +136,19 @@ fi
 TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.1a}"
 FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-12.1a}"
 # Graph-safe fused apply (device-side expert grouping). MTP k=2 decode is
-# 1..4 seqs × 3 tokens; capture sizes must include 3 or vLLM pads and loses.
+# 1..4 seqs × 3 tokens (must include 3). DFlash2 k=7 is 1..4 seqs × 8 tokens
+# (must include 8, 16, 24, 32).
 ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
 if [ "${ENFORCE_EAGER}" != "1" ]; then
     case " ${EXTRA_ARGS:-} " in
         *" --cudagraph-capture-sizes "*|*" cudagraph-capture-sizes "*) ;;
-        *) EXTRA_ARGS="${EXTRA_ARGS:+$EXTRA_ARGS }--cudagraph-capture-sizes 1 2 3 4 6 8 12" ;;
+        *)
+            if [ "$SPEC_METHOD" = "dflash" ]; then
+                EXTRA_ARGS="${EXTRA_ARGS:+$EXTRA_ARGS }--cudagraph-capture-sizes 1 2 4 8 16 24 32"
+            else
+                EXTRA_ARGS="${EXTRA_ARGS:+$EXTRA_ARGS }--cudagraph-capture-sizes 1 2 3 4 6 8 12"
+            fi
+            ;;
     esac
 fi
 # 1 = fused exl3_moe (decode). 0 restores the unique-expert LinearEXL3 loop.
@@ -140,6 +161,7 @@ CONTAINER_WORKER="${CONTAINER_WORKER:-glm53-exl3-worker}"
 
 HF_CACHE_DIR="${HF_HOME:-$HOME/.cache/huggingface}"
 MODEL_PATH="$HF_CACHE_DIR/hub/$MODEL_CACHE_NAME"
+DFLASH_PATH="$HF_CACHE_DIR/hub/$DFLASH_CACHE_NAME"
 WORKER_CACHE_DIR="$WORKER_HOME/.cache/huggingface"
 CACHE_ROOT="${CACHE_ROOT:-$HOME/.cache/vllm-glm53-flash}"
 WORKER_VLLM_CACHE="${WORKER_VLLM_CACHE:-$WORKER_HOME/.cache/vllm-glm53-flash}"
@@ -188,6 +210,25 @@ resolve_model_dir() {
     dir="$MODEL_PATH/snapshots/$hash"
     [ -f "$dir/config.json" ] || die "config.json missing in $dir — re-run with REFRESH_WEIGHTS=1"
     printf '/root/.cache/huggingface/hub/%s/snapshots/%s' "$MODEL_CACHE_NAME" "$hash"
+}
+
+ensure_dflash_refs_main() {
+    local ref="$DFLASH_PATH/refs/main" snap
+    [ -f "$ref" ] && [ -n "$(<"$ref")" ] && return 0
+    snap="$(ls -1t "$DFLASH_PATH/snapshots" 2>/dev/null | head -n 1 || true)"
+    [ -n "$snap" ] || die "no snapshots under $DFLASH_PATH — re-run download"
+    mkdir -p "$DFLASH_PATH/refs"
+    printf '%s' "$snap" >"$ref"
+    log "wrote DFlash2 refs/main -> $snap"
+}
+
+resolve_dflash_dir() {
+    local ref="$DFLASH_PATH/refs/main" hash dir
+    ensure_dflash_refs_main
+    hash="$(<"$ref")"
+    dir="$DFLASH_PATH/snapshots/$hash"
+    [ -f "$dir/config.json" ] || die "DFlash2 config.json missing in $dir"
+    printf '/root/.cache/huggingface/hub/%s/snapshots/%s' "$DFLASH_CACHE_NAME" "$hash"
 }
 
 check_port_free() {
@@ -344,12 +385,40 @@ download_weights() {
 
     mkdir -p "$HF_CACHE_DIR"
     log "downloading ${MODEL} (~164 GiB / ${EXPECTED_SHARDS} shards) into ${HF_CACHE_DIR} ..."
-    HF_HOME="$HF_CACHE_DIR" "$hf" download "$MODEL"
+    local -a hf_excl=()
+    local pat
+    IFS=',' read -ra _excl_pats <<< "${HF_DOWNLOAD_EXCLUDE:-runtime-results/**,src/**,runtime/src/**,scripts/**,docs/**,results/**,.materialization/**,runtime/scripts/**}"
+    for pat in "${_excl_pats[@]}"; do
+        [ -n "$pat" ] && hf_excl+=(--exclude "$pat")
+    done
+    HF_HOME="$HF_CACHE_DIR" "$hf" download "$MODEL" "${hf_excl[@]}"
     ensure_refs_main
     have="$(count_shards "$MODEL_PATH")"
     [ "${have:-0}" -ge "$EXPECTED_SHARDS" ] \
         || die "download finished with $have / $EXPECTED_SHARDS shards"
     log "download complete ($have shards)"
+}
+
+download_dflash() {
+    [ "$SPEC_METHOD" = "dflash" ] || return 0
+    [ "${SKIP_DOWNLOAD:-0}" = "1" ] && { log "SKIP_DOWNLOAD=1 — skipping DFlash2 download check"; return; }
+    local have
+    have="$(find "$DFLASH_PATH/snapshots" -name 'model.safetensors' 2>/dev/null | wc -l | tr -d '[:space:]' || true)"
+    if [ "${have:-0}" -ge 1 ] && [ "${REFRESH_WEIGHTS:-0}" != "1" ]; then
+        log "DFlash2 already present: $DFLASH_PATH"
+        ensure_dflash_refs_main
+        return
+    fi
+    local hf
+    hf="$(command -v hf || command -v huggingface-cli || true)"
+    [ -n "$hf" ] || die "neither 'hf' nor 'huggingface-cli' found — pip install --user -U 'huggingface_hub[cli]'"
+    mkdir -p "$HF_CACHE_DIR"
+    log "downloading ${DFLASH_MODEL} (~2.3 GiB) into ${HF_CACHE_DIR} ..."
+    HF_HOME="$HF_CACHE_DIR" "$hf" download "$DFLASH_MODEL"
+    ensure_dflash_refs_main
+    have="$(find "$DFLASH_PATH/snapshots" -name 'model.safetensors' 2>/dev/null | wc -l | tr -d '[:space:]' || true)"
+    [ "${have:-0}" -ge 1 ] || die "DFlash2 download finished without model.safetensors"
+    log "DFlash2 download complete"
 }
 
 # ------------------------------ weight sync --------------------------------
@@ -360,6 +429,12 @@ sync_weights() {
     worker_ssh "mkdir -p '$WORKER_CACHE_DIR/hub'"
     rsync -a --partial --info=progress2 \
         "$MODEL_PATH/" "${WORKER_SSH}:${WORKER_CACHE_DIR}/hub/${MODEL_CACHE_NAME}/"
+    if [ "$SPEC_METHOD" = "dflash" ]; then
+        [ -d "$DFLASH_PATH" ] || die "DFlash2 weights missing at $DFLASH_PATH"
+        log "syncing DFlash2 draft to worker ..."
+        rsync -a --partial --info=progress2 \
+            "$DFLASH_PATH/" "${WORKER_SSH}:${WORKER_CACHE_DIR}/hub/${DFLASH_CACHE_NAME}/"
+    fi
     log "worker weights in sync"
 }
 
@@ -393,7 +468,16 @@ ARGS=(
 [ -n "${MAX_NUM_SEQS:-}" ] && ARGS+=(--max-num-seqs "${MAX_NUM_SEQS}")
 [ -n "${MAX_NUM_BATCHED_TOKENS:-}" ] && ARGS+=(--max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}")
 [ -n "${KV_CACHE_DTYPE:-}" ] && ARGS+=(--kv-cache-dtype "${KV_CACHE_DTYPE}")
-if [ "${MTP_TOKENS:-0}" != "0" ]; then
+if [ "${SPEC_METHOD:-mtp}" = "dflash" ]; then
+    ARGS+=(--speculative-config "$(python3 -c 'import json,os
+spec={"method":"dflash","model":os.environ["DFLASH_MODEL_DIR"],"num_speculative_tokens":int(os.environ.get("DFLASH_TOKENS","7")),"kv_cache_dtype":"auto","draft_sample_method":"probabilistic","rejection_sample_method":"standard"}
+tp=os.environ.get("DFLASH_DRAFT_TP","").strip()
+if tp:
+    spec["draft_tensor_parallel_size"]=int(tp)
+print(json.dumps(spec,separators=(",",":")))')")
+elif [ "${SPEC_METHOD:-mtp}" = "none" ]; then
+    :
+elif [ "${MTP_TOKENS:-0}" != "0" ]; then
     ARGS+=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${MTP_TOKENS}}")
 fi
 if [ -n "${CHAT_TEMPLATE:-}" ] && [ -f "${CHAT_TEMPLATE}" ]; then
@@ -450,7 +534,16 @@ ARGS=(
 [ -n "${MAX_NUM_SEQS:-}" ] && ARGS+=(--max-num-seqs "${MAX_NUM_SEQS}")
 [ -n "${MAX_NUM_BATCHED_TOKENS:-}" ] && ARGS+=(--max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}")
 [ -n "${KV_CACHE_DTYPE:-}" ] && ARGS+=(--kv-cache-dtype "${KV_CACHE_DTYPE}")
-if [ "${MTP_TOKENS:-0}" != "0" ]; then
+if [ "${SPEC_METHOD:-mtp}" = "dflash" ]; then
+    ARGS+=(--speculative-config "$(python3 -c 'import json,os
+spec={"method":"dflash","model":os.environ["DFLASH_MODEL_DIR"],"num_speculative_tokens":int(os.environ.get("DFLASH_TOKENS","7")),"kv_cache_dtype":"auto","draft_sample_method":"probabilistic","rejection_sample_method":"standard"}
+tp=os.environ.get("DFLASH_DRAFT_TP","").strip()
+if tp:
+    spec["draft_tensor_parallel_size"]=int(tp)
+print(json.dumps(spec,separators=(",",":")))')")
+elif [ "${SPEC_METHOD:-mtp}" = "none" ]; then
+    :
+elif [ "${MTP_TOKENS:-0}" != "0" ]; then
     ARGS+=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${MTP_TOKENS}}")
 fi
 if [ -n "${CHAT_TEMPLATE:-}" ] && [ -f "${CHAT_TEMPLATE}" ]; then
@@ -539,7 +632,9 @@ launch_cluster() {
     local v
     for v in SERVED_MODEL_NAME PORT TP NNODES HEAD_IP MASTER_PORT QUANTIZATION \
              MAX_MODEL_LEN GPU_MEM_UTIL MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS \
-             KV_CACHE_DTYPE MTP_TOKENS LANGUAGE_MODEL_ONLY SKIP_MM_PROFILING \
+             KV_CACHE_DTYPE MTP_TOKENS SPEC_METHOD DFLASH_TOKENS DFLASH_MODEL_DIR \
+             DFLASH_DRAFT_TP \
+             LANGUAGE_MODEL_ONLY SKIP_MM_PROFILING \
              LIMIT_MM CHAT_TEMPLATE ENFORCE_EAGER EXL3_FUSED_MOE MODEL_DIR EXTRA_ARGS; do
         serve_env+=" -e $v='${!v:-}'"
     done
@@ -587,6 +682,10 @@ launch_cluster() {
         -e MAX_NUM_SEQS="$MAX_NUM_SEQS" \
         -e MAX_NUM_BATCHED_TOKENS="$MAX_NUM_BATCHED_TOKENS" \
         -e KV_CACHE_DTYPE="$KV_CACHE_DTYPE" -e MTP_TOKENS="$MTP_TOKENS" \
+        -e SPEC_METHOD="$SPEC_METHOD" \
+        -e DFLASH_TOKENS="${DFLASH_TOKENS:-7}" \
+        -e DFLASH_MODEL_DIR="${DFLASH_MODEL_DIR:-}" \
+        -e DFLASH_DRAFT_TP="${DFLASH_DRAFT_TP:-}" \
         -e LANGUAGE_MODEL_ONLY="$LANGUAGE_MODEL_ONLY" \
         -e SKIP_MM_PROFILING="$SKIP_MM_PROFILING" \
         -e LIMIT_MM="$LIMIT_MM" \
@@ -653,7 +752,10 @@ on_ready() {
     log "  weights    : ${MODEL}  quant=${QUANTIZATION}  kv=${KV_CACHE_DTYPE}"
     local vision=on
     [ "${LANGUAGE_MODEL_ONLY}" = "1" ] && vision=off
-    log "  features   : tools=glm47+auto, reasoning=glm45, MTP k=${MTP_TOKENS}, vision=${vision}"
+    local spec="MTP k=${MTP_TOKENS}"
+    [ "$SPEC_METHOD" = "dflash" ] && spec="DFlash2 k=${DFLASH_TOKENS} (${DFLASH_MODEL})"
+    [ "$SPEC_METHOD" = "none" ] && spec=off
+    log "  features   : tools=glm47+auto, reasoning=glm45, spec=${spec}, vision=${vision}"
     log "  quick test :"
     log "    curl -s http://127.0.0.1:${PORT}/v1/chat/completions \\"
     log "      -H 'Content-Type: application/json' \\"
@@ -673,12 +775,18 @@ start() {
     preflight
     ensure_image
     download_weights
+    download_dflash
     sync_weights
     write_inner_scripts
 
     MODEL_DIR="$(resolve_model_dir)"
+    DFLASH_MODEL_DIR=""
+    if [ "$SPEC_METHOD" = "dflash" ]; then
+        DFLASH_MODEL_DIR="$(resolve_dflash_dir)"
+        log "DFlash2 load path (in-container): ${DFLASH_MODEL_DIR}"
+    fi
     log "model load path (in-container): ${MODEL_DIR}"
-    log "config: image=${IMAGE} tp=${TP} nnodes=${NNODES} quant=${QUANTIZATION} mtp=${MTP_TOKENS} max-len=${MAX_MODEL_LEN} gpu-util=${GPU_MEM_UTIL} kv=${KV_CACHE_DTYPE} lm-only=${LANGUAGE_MODEL_ONLY} port=${PORT}"
+    log "config: image=${IMAGE} tp=${TP} nnodes=${NNODES} quant=${QUANTIZATION} spec=${SPEC_METHOD} mtp=${MTP_TOKENS} dflash_k=${DFLASH_TOKENS} max-len=${MAX_MODEL_LEN} gpu-util=${GPU_MEM_UTIL} kv=${KV_CACHE_DTYPE} lm-only=${LANGUAGE_MODEL_ONLY} port=${PORT}"
 
     launch_cluster
     if wait_for_health; then

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """EXL3/MCG trellis quantization for GLM-5.3-Flash routed experts.
 
-Checkpoint ABI (brandonmusic/GLM-5.3-Flash-EXL3-4bpw):
+Checkpoint ABI (brandonmusic/GLM-5.3-Flash-tr3-4bpw):
   quant_method=exl3, codebook=mcg, scope=glm53_routed_experts_only
   per expert matrix: trellis (int16) + suh/svh (fp16) + mcg (int32 marker)
 
@@ -486,15 +486,19 @@ class Exl3Config(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "Exl3Config":
+        skip = {
+            "bits",
+            "codebook",
+            "scope",
+            "quant_method",
+            # tr3 ships a 37 MiB per-tensor ledger; keep it off the config object.
+            "tensor_storage",
+        }
         return cls(
             bits=int(config.get("bits", 4)),
             codebook=str(config.get("codebook", "mcg")),
             scope=str(config.get("scope", "glm53_routed_experts_only")),
-            **{
-                k: v
-                for k, v in config.items()
-                if k not in {"bits", "codebook", "scope", "quant_method"}
-            },
+            **{k: v for k, v in config.items() if k not in skip},
         )
 
     @classmethod

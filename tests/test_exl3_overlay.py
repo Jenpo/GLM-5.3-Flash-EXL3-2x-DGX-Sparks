@@ -254,11 +254,71 @@ def _check_fused_cudagraph(device) -> None:
     print(f"exl3 fused CUDA graph capture OK maxabs={err:.5f}", flush=True)
 
 
+def _check_dflash2() -> None:
+    from pathlib import Path
+
+    from vllm.model_executor.models.qwen3_dflash import (
+        DFlashQwen3DecoderLayer,
+        DFlashQwen3ForCausalLM,
+        DFlashQwen3Model,
+    )
+    from vllm.model_executor.models.qwen3_dflash2 import (
+        DFlash2Qwen3DecoderLayer,
+        DFlash2Qwen3ForCausalLM,
+        DFlash2Qwen3Model,
+    )
+    from vllm.model_executor.models.registry import _SPECULATIVE_DECODING_MODELS
+
+    assert DFlashQwen3Model.decoder_layer_cls is DFlashQwen3DecoderLayer
+    assert DFlashQwen3ForCausalLM.model_cls is DFlashQwen3Model
+    assert DFlash2Qwen3Model.decoder_layer_cls is DFlash2Qwen3DecoderLayer
+    assert DFlash2Qwen3ForCausalLM.model_cls is DFlash2Qwen3Model
+    assert _SPECULATIVE_DECODING_MODELS["DFlash2DraftModel"] == (
+        "qwen3_dflash2",
+        "DFlash2Qwen3ForCausalLM",
+    )
+    qwen = Path(
+        "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/qwen3_dflash.py"
+    ).read_text()
+    assert "self.decoder_layer_cls(" in qwen
+    assert "DFlashQwen3DecoderLayer(" not in qwen.split("self.layers")[1].split("def embed_input_ids")[0]
+    spec_init = Path(
+        "/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/spec_decode/__init__.py"
+    ).read_text()
+    assert "DFlash2Speculator" in spec_init
+    assert "DFlash2DraftModel" in spec_init
+    dflash_utils = Path(
+        "/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/spec_decode/dflash/utils.py"
+    ).read_text()
+    assert 'draft_kv = "auto"' in dflash_utils
+    assert '"fp8_ds_mla"' in dflash_utils
+    glm = Path(
+        "/usr/local/lib/python3.12/dist-packages/vllm/models/glm5next/nvidia/model.py"
+    ).read_text()
+    assert "class Glm5NextModel(nn.Module, EagleModelMixin):" in glm
+    assert "SupportsEagle3" in glm
+    assert "aux_hidden_state_layers" in glm
+    assert "layer.hc_post(hidden_states, residual, post, comb)" in glm
+    assert "hc_contract(" in glm
+    assert "return hidden_states, aux_hidden_states" in glm
+    kv = Path(
+        "/usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_utils.py"
+    ).read_text()
+    assert "DFLASH2-DRAFTER-GROUP" in kv
+    assert "type(v) is SlidingWindowSpec" in kv
+    src = Path("/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/qwen3_dflash.py").read_text()
+    # Top-level is_causal must win so GLM-5.3-Flash-DFlash2 (is_causal=false,
+    # all sliding_attention) does not silently draft as causal DFlash1.
+    assert 'getattr(config, "is_causal", None)' in src
+    print("dflash2 overlay OK", flush=True)
+
+
 def main() -> int:
     require_gpu = os.environ.get("EXL3_SELFCHECK_GPU", "1") != "0"
     _check_quant_registry()
     _check_tp_shard()
     _check_ext_arch()
+    _check_dflash2()
     if require_gpu:
         _check_gpu_gemm()
     else:
