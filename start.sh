@@ -353,6 +353,14 @@ preflight() {
     avail=$(worker_ssh "df -Pk '$WORKER_HOME' 2>/dev/null" | awk 'NR==2{print $4}' || true)
     [ "${avail:-0}" -ge "$need_kb" ] || warn "only $((avail/1024/1024)) GiB free on worker for a ~164 GiB model"
 
+    # The worker HF cache must be writable by the SSH user before the ~164 GiB
+    # sync starts. A root-owned ~/.cache/huggingface (prior sudo/docker
+    # prepare on the worker) otherwise fails mid-sync with a bare mkdir
+    # permission error. mkdir -p is idempotent and is what sync does anyway.
+    if ! worker_ssh "mkdir -p '$WORKER_CACHE_DIR/hub' && test -w '$WORKER_CACHE_DIR/hub'"; then
+        die "worker cannot write $WORKER_CACHE_DIR/hub as $( [ -n "${WORKER_USER:-}" ] && echo "$WORKER_USER" || echo "$USER" ) — fix ownership on the worker, e.g.: ssh $WORKER_SSH \"sudo chown -R ${WORKER_USER:-\$USER}: '$WORKER_CACHE_DIR'\""
+    fi
+
     log "preflight OK (head=$(hostname) ${HEAD_IP}, worker=${WORKER_SSH})"
 }
 
@@ -557,16 +565,37 @@ adopt_complete_weights() {
     return 1
 }
 
+# Resolve the HF CLI even when it lives outside PATH (venv installs), with a
+# python huggingface_hub fallback when no binary exists (issue #22, item 1).
+# Sets the global HF_BIN_CMD array. HF_BIN (may contain arguments) wins when
+# its first word resolves. Returns 1 when nothing usable is found.
+resolve_hf_bin() {
+    HF_BIN_CMD=()
+    if [ -n "${HF_BIN:-}" ]; then
+        read -ra HF_BIN_CMD <<< "$HF_BIN"
+        if command -v "${HF_BIN_CMD[0]}" >/dev/null 2>&1; then return 0; fi
+        HF_BIN_CMD=()
+    fi
+    local cand
+    for cand in hf huggingface-cli "$HOME/.local/bin/hf" "$HOME/.hf-cli/venv/bin/hf" /opt/hf-cli/venv/bin/hf; do
+        if command -v "$cand" >/dev/null 2>&1; then HF_BIN_CMD=("$cand"); return 0; fi
+    done
+    if command -v python3 >/dev/null 2>&1 && python3 -c 'import huggingface_hub' >/dev/null 2>&1; then
+        HF_BIN_CMD=(python3 -m huggingface_hub.commands.huggingface_cli)
+        return 0
+    fi
+    return 1
+}
+
 hf_download_repo() {
     local repo="$1"
-    local hf_bin="$2"
-    shift 2
+    shift
     local -a args=("$repo")
     if [ -n "${MODEL_REVISION:-}" ] && [ "$repo" = "$MODEL" ]; then
         args+=(--revision "$MODEL_REVISION")
     fi
     args+=("$@")
-    HF_HOME="$HF_CACHE_DIR" "$hf_bin" download "${args[@]}"
+    HF_HOME="$HF_CACHE_DIR" "${HF_BIN_CMD[@]}" download "${args[@]}"
 }
 
 download_weights() {
@@ -575,9 +604,7 @@ download_weights() {
         return
     fi
 
-    local hf
-    hf="$(command -v hf || command -v huggingface-cli || true)"
-    [ -n "$hf" ] || die "neither 'hf' nor 'huggingface-cli' found — pip install --user -U 'huggingface_hub[cli]'"
+    resolve_hf_bin || die "no 'hf' / 'huggingface-cli' on PATH and no python huggingface_hub — pip install --user -U 'huggingface_hub[cli]' (or set HF_BIN=/path/to/hf)"
 
     mkdir -p "$HF_CACHE_DIR"
     local -a hf_excl=()
@@ -588,14 +615,14 @@ download_weights() {
     done
 
     log "downloading ${MODEL} (~164 GiB / ${EXPECTED_SHARDS} shards) into ${HF_CACHE_DIR} ..."
-    hf_download_repo "$MODEL" "$hf" "${hf_excl[@]}" || warn "download of ${MODEL} failed — will try ${MODEL_FALLBACK}"
+    hf_download_repo "$MODEL" "${hf_excl[@]}" || warn "download of ${MODEL} failed — will try ${MODEL_FALLBACK}"
     if adopt_complete_weights; then
         return
     fi
 
     if [ "$MODEL_FALLBACK" != "$MODEL" ]; then
         log "falling back to ${MODEL_FALLBACK} ..."
-        hf_download_repo "$MODEL_FALLBACK" "$hf" "${hf_excl[@]}" \
+        hf_download_repo "$MODEL_FALLBACK" "${hf_excl[@]}" \
             || die "download of ${MODEL} and ${MODEL_FALLBACK} both failed"
     fi
     adopt_complete_weights \
@@ -612,12 +639,10 @@ download_dflash() {
         ensure_dflash_refs_main
         return
     fi
-    local hf
-    hf="$(command -v hf || command -v huggingface-cli || true)"
-    [ -n "$hf" ] || die "neither 'hf' nor 'huggingface-cli' found — pip install --user -U 'huggingface_hub[cli]'"
+    resolve_hf_bin || die "no 'hf' / 'huggingface-cli' on PATH and no python huggingface_hub — pip install --user -U 'huggingface_hub[cli]' (or set HF_BIN=/path/to/hf)"
     mkdir -p "$HF_CACHE_DIR"
     log "downloading ${DFLASH_MODEL} (~2.3 GiB) into ${HF_CACHE_DIR} ..."
-    HF_HOME="$HF_CACHE_DIR" "$hf" download "$DFLASH_MODEL"
+    HF_HOME="$HF_CACHE_DIR" "${HF_BIN_CMD[@]}" download "$DFLASH_MODEL"
     ensure_dflash_refs_main
     have="$(find "$DFLASH_PATH/snapshots" -name 'model.safetensors' 2>/dev/null | wc -l | tr -d '[:space:]' || true)"
     [ "${have:-0}" -ge 1 ] || die "DFlash2 download finished without model.safetensors"
@@ -626,9 +651,8 @@ download_dflash() {
 
 # Head-only Hub fetch. No docker, no SSH, no worker rsync.
 download_only() {
-    local hf have
-    hf="$(command -v hf || command -v huggingface-cli || true)"
-    [ -n "$hf" ] || die "neither 'hf' nor 'huggingface-cli' found — pip install --user -U 'huggingface_hub[cli]'"
+    local have
+    resolve_hf_bin || die "no 'hf' / 'huggingface-cli' on PATH and no python huggingface_hub — pip install --user -U 'huggingface_hub[cli]' (or set HF_BIN=/path/to/hf)"
     mkdir -p "$HF_CACHE_DIR"
     local need_kb=$((180 * 1024 * 1024)) avail
     avail=$(df -Pk "$HF_CACHE_DIR" 2>/dev/null | awk 'NR==2{print $4}' || true)
@@ -655,18 +679,46 @@ download_only() {
 }
 
 # ------------------------------ weight sync --------------------------------
+# Keyed on the snapshot commit (refs/main, with the same repair fallback as
+# ensure_refs_main), not on MODEL_REVISION: the marker lives inside each
+# synced repo folder, so a MODEL / revision switch re-syncs automatically.
+# Without it, every ./start.sh pays a full size+mtime re-verification walk
+# over ~164 GiB / 120 shards on both ends for zero bytes of difference
+# (issue #22, item 2). FORCE_SYNC=1 bypasses the marker; deleting the
+# marker file on the worker has the same effect.
+sync_repo_marker_rev() {
+    local src="$1"
+    local rev
+    rev="$(cat "$src/refs/main" 2>/dev/null || true)"
+    [ -n "$rev" ] || rev="$(ls -1t "$src/snapshots" 2>/dev/null | head -n 1 || true)"
+    [ -n "$rev" ] || rev="unknown"
+    printf '%s' "$rev"
+}
+
+sync_repo_to_worker() {
+    local src="$1" cache_name="$2" label="$3"
+    local marker rev
+    marker="${WORKER_CACHE_DIR}/hub/${cache_name}/.glm53-exl3-synced"
+    rev="$(sync_repo_marker_rev "$src")"
+    if [ "${FORCE_SYNC:-0}" != "1" ] \
+       && [ "$(worker_ssh "cat '$marker' 2>/dev/null" || true)" = "$rev" ]; then
+        log "worker ${cache_name} already at ${rev} — rsync skipped (FORCE_SYNC=1 to force)"
+        return 0
+    fi
+    log "syncing ${label} to worker (first run moves ~164 GiB over the p2p link) ..."
+    worker_ssh "mkdir -p '${WORKER_CACHE_DIR}/hub/${cache_name}'"
+    rsync -a --partial --info=progress2 \
+        "$src/" "${WORKER_SSH}:${WORKER_CACHE_DIR}/hub/${cache_name}/"
+    worker_ssh "printf '%s' '$rev' > '$marker'"
+}
+
 sync_weights() {
     [ "${SKIP_SYNC:-0}" = "1" ] && { log "SKIP_SYNC=1 — not syncing to worker"; return; }
     [ -d "$MODEL_PATH" ] || die "weights missing at $MODEL_PATH — run without SKIP_DOWNLOAD first"
-    log "syncing weights to worker (first run moves ~164 GiB over the p2p link) ..."
-    worker_ssh "mkdir -p '$WORKER_CACHE_DIR/hub'"
-    rsync -a --partial --info=progress2 \
-        "$MODEL_PATH/" "${WORKER_SSH}:${WORKER_CACHE_DIR}/hub/${MODEL_CACHE_NAME}/"
+    sync_repo_to_worker "$MODEL_PATH" "$MODEL_CACHE_NAME" "weights"
     if [ "$SPEC_METHOD" = "dflash" ]; then
         [ -d "$DFLASH_PATH" ] || die "DFlash2 weights missing at $DFLASH_PATH"
-        log "syncing DFlash2 draft to worker ..."
-        rsync -a --partial --info=progress2 \
-            "$DFLASH_PATH/" "${WORKER_SSH}:${WORKER_CACHE_DIR}/hub/${DFLASH_CACHE_NAME}/"
+        sync_repo_to_worker "$DFLASH_PATH" "$DFLASH_CACHE_NAME" "DFlash2 draft"
     fi
     log "worker weights in sync"
 }
@@ -1012,12 +1064,26 @@ wait_for_health() {
     docker logs -f --tail 0 "$CONTAINER_HEAD" 2>&1 &
     logpid=$!
 
-    local elapsed=0 healthy=0 exited=0
+    local elapsed=0 healthy=0 exited=0 dead_side="" worker_fail=0
     while [ "$elapsed" -lt "$READY_TIMEOUT" ]; do
         if curl -fsS -m 5 "$url" >/dev/null 2>&1; then healthy=1; break; fi
         if ! docker inspect -f '{{.State.Running}}' "$CONTAINER_HEAD" 2>/dev/null | grep -q true; then
             log "head container exited during startup"
-            exited=1; break
+            exited=1; dead_side="head"; break
+        fi
+        # A dead worker rank can never make the head healthy — fail fast with
+        # the log dump instead of polling for the full READY_TIMEOUT (issue
+        # #22, item 4). Transient ssh/docker hiccups are tolerated; only
+        # three consecutive non-running answers (~30 s) count as a dead
+        # worker.
+        if worker_ssh "docker inspect -f '{{.State.Running}}' '$CONTAINER_WORKER' 2>/dev/null" | grep -q true; then
+            worker_fail=0
+        else
+            worker_fail=$((worker_fail + 1))
+            if [ "$worker_fail" -ge 3 ]; then
+                log "worker container '$CONTAINER_WORKER' not running on ${WORKER_SSH} (3 consecutive checks)"
+                exited=1; dead_side="worker"; break
+            fi
         fi
         sleep 10; elapsed=$((elapsed + 10))
     done
@@ -1028,7 +1094,7 @@ wait_for_health() {
     if [ "$healthy" = "1" ]; then
         log "health check passed after ${elapsed}s — server is up"
     elif [ "$exited" = "1" ]; then
-        warn "head container exited after ${elapsed}s"
+        warn "${dead_side:-head} container exited/stopped after ${elapsed}s"
     else
         warn "timed out after ${elapsed}s without becoming healthy"
     fi
