@@ -104,6 +104,11 @@ HEAD_CX7_IB="${HEAD_CX7_IB:-rocep1s0f1}"
 WORKER_CX7_IB="${WORKER_CX7_IB:-rocep1s0f0}"
 NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
+# vLLM subtracts a CUDA-graph memory ESTIMATE from the KV pool. On this kit the
+# estimate is 2.43 GiB while the captured graphs actually consume -0.19 GiB, so
+# ~2.6 GiB of KV is reserved and never used. 0 keeps CUDA graphs ON and drops only
+# the deduction. 1 = upstream default.
+CG_ESTIMATE="${CG_ESTIMATE:-1}"
 NCCL_CROSS_NIC="${NCCL_CROSS_NIC:-0}"
 NCCL_HOST_DIR="${NCCL_HOST_DIR:-$HOME/nccl-2.30.7}"
 WORKER_NCCL_HOST_DIR="${WORKER_NCCL_HOST_DIR:-$WORKER_HOME/nccl-2.30.7}"
@@ -880,6 +885,7 @@ launch_cluster() {
         # thread then dumps JSONDecodeError. Stats are off on this private kit.
         -e VLLM_NO_USAGE_STATS=1
         -e DO_NOT_TRACK=1
+        -e "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=$CG_ESTIMATE"
     )
     local worker_nccl="" e
     for e in "${nccl_common[@]}"; do
