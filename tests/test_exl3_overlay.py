@@ -119,6 +119,7 @@ def _check_gpu_gemm() -> None:
         flush=True,
     )
     _check_fused_vs_loop(device)
+    _check_fused_fat_and_row_tile(device)
     _check_apply_expert_map(device)
     _check_fused_cudagraph(device)
 
@@ -185,6 +186,64 @@ def _check_fused_vs_loop(device) -> None:
     assert max_err < bound, f"fused vs loop maxabs={max_err} bound={bound} mean_scale={scale}"
     print(
         f"exl3 fused vs LinearEXL3 loop OK maxabs={max_err:.5f} bound={bound:.5f}",
+        flush=True,
+    )
+
+
+def _check_fused_fat_and_row_tile(device) -> None:
+    """T > TEMP_ROWS_FUSED: fallback loop vs GPU row tiles vs unique-expert loop."""
+    import os
+
+    import torch
+    from vllm.model_executor.layers.quantization.exl3 import (
+        apply_exl3_experts,
+        reset_exl3_fat_expert_stats,
+    )
+
+    prev_tile = os.environ.get("EXL3_MOE_ROW_TILE")
+    prev_log = os.environ.get("EXL3_FAT_EXPERT_LOG")
+    prev_rows = os.environ.get("EXL3_TEMP_ROWS_FUSED")
+    os.environ["EXL3_FAT_EXPERT_LOG"] = "1"
+    os.environ["EXL3_TEMP_ROWS_FUSED"] = "128"
+    try:
+        method, layer = _tiny_layer(device)
+        del method
+        tokens = 128 + 32
+        x = torch.randn(tokens, 256, dtype=torch.float16, device=device)
+        # All rows hit expert 0 so count[0] = tokens > 128 (plus expert 1 at tokens).
+        ids = torch.zeros(tokens, 2, dtype=torch.long, device=device)
+        ids[:, 1] = 1
+        w = torch.full((tokens, 2), 0.5, dtype=torch.float16, device=device)
+        os.environ["EXL3_MOE_ROW_TILE"] = "0"
+        reset_exl3_fat_expert_stats()
+        y_loop = apply_exl3_experts(x, ids, w, layer, fused=False)
+        y_fb = apply_exl3_experts(x, ids, w, layer, fused=True)
+        assert torch.isfinite(y_loop).all() and torch.isfinite(y_fb).all()
+        err_fb = float((y_loop.float() - y_fb.float()).abs().max())
+        bound = max(0.15, 0.08 * float(y_loop.float().abs().max().clamp_min(1.0)))
+        assert err_fb < bound, f"fat fallback vs loop maxabs={err_fb} bound={bound}"
+
+        os.environ["EXL3_MOE_ROW_TILE"] = "1"
+        y_tile = apply_exl3_experts(x, ids, w, layer, fused=True)
+        assert torch.isfinite(y_tile).all()
+        err_tile = float((y_loop.float() - y_tile.float()).abs().max())
+        assert err_tile < bound, f"row-tile vs loop maxabs={err_tile} bound={bound}"
+    finally:
+        if prev_tile is None:
+            os.environ.pop("EXL3_MOE_ROW_TILE", None)
+        else:
+            os.environ["EXL3_MOE_ROW_TILE"] = prev_tile
+        if prev_log is None:
+            os.environ.pop("EXL3_FAT_EXPERT_LOG", None)
+        else:
+            os.environ["EXL3_FAT_EXPERT_LOG"] = prev_log
+        if prev_rows is None:
+            os.environ.pop("EXL3_TEMP_ROWS_FUSED", None)
+        else:
+            os.environ["EXL3_TEMP_ROWS_FUSED"] = prev_rows
+    print(
+        f"exl3 fat fallback + row-tile vs loop OK "
+        f"T={tokens} fb={err_fb:.5f} tile={err_tile:.5f} bound={bound:.5f}",
         flush=True,
     )
 
