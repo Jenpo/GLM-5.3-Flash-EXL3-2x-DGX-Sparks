@@ -340,11 +340,13 @@ that are now documented/enforced:
   `WORKER_CX7_IF/IB` in `.env` (some pairs use the same names on both nodes,
   e.g. `enP2p1s0f1np1`/`roceP2p1s0f1`). Exporting generic
   `NCCL_SOCKET_IFNAME`/`NCCL_IB_HCA` does **not** override the per-node values.
-- **`NCCL_IB_GID_INDEX` (default 3) may be an all-zero entry on one node** —
-  the launch then dies ~60 s in with `ibv_modify_qp` errno 61 on the worker
-  rank. `preflight` now validates the index on both devices and prints both
-  GID tables when it refuses; pick the index carrying the `::ffff:<ip>`
-  RoCEv2 entry on both nodes.
+- **The RoCEv2 GID index is per-NIC** — each node needs the index carrying its
+  own `::ffff:<ip>` entry, and an all-zero entry kills that rank ~60 s in with
+  `ibv_modify_qp` errno 61. Preflight validates each rank against its own device
+  and dumps both GID tables (0–7) when it refuses. If one index is valid on both
+  nodes, set `NCCL_IB_GID_INDEX`; if the nodes need different indices, set
+  `HEAD_GID` / `WORKER_GID` per rank (both default to `NCCL_IB_GID_INDEX`).
+
 - **`GPU_MEM_UTIL=0.87` needs ≥105.9 GiB free *after* vLLM's own ~9 GiB
   init.** Nodes running resident services (dashboards, TTS, desktop) can miss
   it by well under 1 GiB and fail the startup memory check; `GPU_MEM_UTIL=0.86`
