@@ -251,6 +251,20 @@ This 1M boot: **1,670,157** tokens / **1.67×** / 638 GPU blocks (padded
 slot-share still applied). The 900k process measured 1,754,237 / 690 blocks
 on the same recipe; the delta is leftover UMA, not a slot-share collapse.
 
+Re-measure (see also `tests/bench_prefix_cache.py`):
+
+```bash
+# unique-content cold/warm pairs; hit ratio from the vllm:prefix_cache_*
+# counter deltas; hit_efficiency scores against the 3584-token page model
+python3 tests/bench_prefix_cache.py --runs 3
+```
+
+Note the page math: hits are **block-aligned to the 3584-token hybrid MLA
+page**, so a warm prompt only ever reuses `floor(tokens / 3584) × 3584`
+tokens — the 7168 / 10752 / 14336 hit rows above are exactly 2 / 3 / 4 full
+pages. And since this build exposes **no cache-reset endpoint**, the bench
+salts its filler content per invocation so every cold is genuinely cold.
+
 ## Quick start (2× Spark)
 
 ```bash
