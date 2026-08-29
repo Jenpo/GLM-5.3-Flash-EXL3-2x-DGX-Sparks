@@ -124,16 +124,21 @@ checkpoint `is_causal: false` so draft attention is bidirectional inside the
 block. Draft KV is forced `auto` because dense DFlash2 cannot use the target's
 `fp8_ds_mla` layout and SM121 has no FA3/FA4 for plain FP8.
 
-The pinned vLLM `487ecf187` also predates the merged XGrammar speculative-batch
-termination fix. `overlay/patch_xgrammar_termination.py` is a source-exact
-behavioral backport of [vLLM PR #52805](https://github.com/vllm-project/vllm/pull/52805)
-([commit `12f64b39`](https://github.com/vllm-project/vllm/commit/12f64b39d29282437e35be9aa5db432fb2a1a6e6)).
-It stops `accept_tokens()` and `validate_tokens()` at the first terminating
-token, ignores later advances after termination, and clears the cached flag on
-reset. The fail-closed, idempotent script is mounted and run on both ranks. This
-fixes the matcher-after-stop defect in issue #19; it does not reinterpret an
-invalid client request that combines GLM XML tool output with a JSON response
-schema, nor does it remove cold-prefill queue time.
+The pinned vLLM `487ecf187` also predates two merged XGrammar speculative-decode
+fixes. `overlay/patch_xgrammar_termination.py` source-exactly backports
+[vLLM PR #52805](https://github.com/vllm-project/vllm/pull/52805)
+([commit `12f64b39`](https://github.com/vllm-project/vllm/commit/12f64b39d29282437e35be9aa5db432fb2a1a6e6))
+and [vLLM PR #53046](https://github.com/vllm-project/vllm/pull/53046)
+([commit `c6e19b3`](https://github.com/vllm-project/vllm/commit/c6e19b3be24338759a443e03c8325d76da9ee202)).
+The first stops `accept_tokens()` and `validate_tokens()` at the first
+terminating token, ignores later advances after termination, and clears the
+cached flag on reset. The second validates drafts produced before a mid-window
+reasoning-end marker before advancing the newly active grammar, avoiding a
+spurious `Failed to advance FSM` error for invalid drafts. The fail-closed,
+idempotent script preflights both source files before writing and is already
+mounted and run on both ranks. These address issue #19's matcher-error paths;
+they do not reinterpret a client request that combines GLM XML tool output
+with a JSON response schema, nor do they remove cold-prefill queue time.
 
 `overlay/patch_glm_video_placeholders.py` routes Glm5Next video timestamps through
 the glm46v path and aligns placeholder blocks to encoder `grid_t`. The overlay
@@ -418,8 +423,8 @@ this Dockerfile instead. After CUDA compile, Python overlay edits
 | `overlay/patch_glm_video_placeholders.py` | align video timestamp blocks to encoder `grid_t` |
 | `overlay/patch_suppress_stops_in_reasoning.py` | fail-closed detokenizer guard: client `stop` dormant until `</think>` |
 | `overlay/patch_scheduler_decode_floor.py` | skip (or cap) peer prefill while another seq is decoding |
-| `overlay/patch_xgrammar_termination.py` | source-exact vLLM #52805 backport; stop speculative XGrammar batches at termination |
-| `tests/test_xgrammar_termination.py` | exact patch, idempotence, fail-closed drift, termination/rollback/reset behavior, launcher wiring |
+| `overlay/patch_xgrammar_termination.py` | source-exact vLLM #52805/#53046 backports; stop at termination and validate post-reasoning speculative drafts before FSM advance |
+| `tests/test_xgrammar_termination.py` | exact two-file patch, idempotence, cross-file fail-closed drift, termination/rollback/reset and post-reasoning draft behavior, launcher wiring |
 | `scripts/boot-shape-warmup.sh` | post-`/health` DFlash2 k=7 BLOCK ladder + sampler/kpool arms |
 
 Image-build runs `EXL3_SELFCHECK_GPU=0`. `./start.sh` runs the GPU self-check
@@ -456,4 +461,3 @@ DFlash2 stays [CC BY-NC-ND 4.0](https://huggingface.co/incoai/GLM-5.3-Flash-DFla
   (CC BY-NC-ND 4.0, research/eval)
 - **KLD panel:** [malaiwah](https://huggingface.co/malaiwah) —
   [discussion #1](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw/discussions/1#6a9144846b0bdba943bfe86f)
-

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Backport vLLM's XGrammar speculative-batch termination fix.
+"""Backport vLLM's XGrammar speculative-decoding fixes.
 
 The base image pins vLLM ``487ecf187``, whose XGrammar backend can continue
 feeding tokens to a matcher after an EOS/stop token terminates it.  That is
@@ -7,15 +7,25 @@ especially visible with a multi-token speculative batch: the first trailing
 token is rejected, subsequent advances can warn, and the cached termination
 flag can become inconsistent with the matcher.
 
-This is a source-exact behavioral backport of upstream vLLM PR #52805, merged
-as commit 12f64b39d29282437e35be9aa5db432fb2a1a6e6:
+This applies two source-exact behavioral backports:
+
+* vLLM PR #52805, merged as commit
+  ``12f64b39d29282437e35be9aa5db432fb2a1a6e6``, stops token batches at
+  grammar termination.
+* vLLM PR #53046, merged as commit
+  ``c6e19b3be24338759a443e03c8325d76da9ee202``, validates speculative
+  drafts produced before a mid-window reasoning-end marker before advancing
+  the grammar.  This avoids a spurious ``Failed to advance FSM`` error when
+  such a draft is invalid under the newly active grammar.
 
 https://github.com/vllm-project/vllm/pull/52805
 https://github.com/vllm-project/vllm/commit/12f64b39d29282437e35be9aa5db432fb2a1a6e6
+https://github.com/vllm-project/vllm/pull/53046
+https://github.com/vllm-project/vllm/commit/c6e19b3be24338759a443e03c8325d76da9ee202
 
-Only the three upstream method edits are made.  The patch is idempotent and
-fails closed before writing if the pinned anchors drift or a partial patch is
-found.
+Only the exact upstream behavior is changed.  The patch is idempotent and
+preflights both files before writing, failing closed if a pinned anchor drifts
+or a partial patch is found.
 """
 from __future__ import annotations
 
@@ -25,15 +35,26 @@ import sys
 from pathlib import Path
 
 
-TARGET = Path(
+BACKEND_TARGET = Path(
     os.environ.get(
         "GLM53_XGRAMMAR_BACKEND_PY",
         "/usr/local/lib/python3.12/dist-packages/vllm/v1/structured_output/"
         "backend_xgrammar.py",
     )
 )
-MARK = (
+MANAGER_TARGET = Path(
+    os.environ.get(
+        "GLM53_XGRAMMAR_MANAGER_PY",
+        "/usr/local/lib/python3.12/dist-packages/vllm/v1/structured_output/"
+        "__init__.py",
+    )
+)
+BACKEND_MARK = (
     "    # [glm53-xgrammar-termination] Source-exact vLLM 12f64b39 backport.\n"
+)
+MANAGER_MARK = (
+    "                    # [glm53-xgrammar-reasoning] Source-exact vLLM "
+    "c6e19b3 backport.\n"
 )
 
 ACCEPT_OLD = '''    def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
@@ -135,8 +156,33 @@ RESET_UPSTREAM = '''    def reset(self):
         self._is_terminated = False
 '''
 
+MANAGER_OLD = '''                    if advance_grammar and not grammar.is_terminated():
+                        accepted = grammar.accept_tokens(req_id, [token])
+                        if accepted:
+                            state_advancements += 1
+                        elif not post_reasoning_end_in_window:
+                            raise AssertionError(
+                                (token, req_id, scheduled_spec_decode_tokens)
+                            )
+'''
 
-def counts(text: str) -> tuple[list[int], list[int]]:
+MANAGER_UPSTREAM = '''                    if advance_grammar and not grammar.is_terminated():
+                        if post_reasoning_end_in_window:
+                            accepted = bool(grammar.validate_tokens([token]))
+                            if accepted:
+                                accepted = grammar.accept_tokens(req_id, [token])
+                        else:
+                            accepted = grammar.accept_tokens(req_id, [token])
+                        if accepted:
+                            state_advancements += 1
+                        elif not post_reasoning_end_in_window:
+                            raise AssertionError(
+                                (token, req_id, scheduled_spec_decode_tokens)
+                            )
+'''
+
+
+def backend_counts(text: str) -> tuple[list[int], list[int]]:
     old = [text.count(x) for x in (ACCEPT_OLD, VALIDATE_OLD, RESET_OLD)]
     new = [
         text.count(ACCEPT_UPSTREAM),
@@ -146,63 +192,98 @@ def counts(text: str) -> tuple[list[int], list[int]]:
     return old, new
 
 
-def verified_upstream_state(text: str) -> bool:
-    old, new = counts(text)
+def verified_backend_state(text: str) -> bool:
+    old, new = backend_counts(text)
     return old == [0, 0, 0] and new == [1, 1, 1]
 
 
-def main() -> int:
-    if not TARGET.is_file():
-        raise SystemExit(f"missing {TARGET}")
+def verified_manager_state(text: str) -> bool:
+    return text.count(MANAGER_OLD) == 0 and text.count(MANAGER_UPSTREAM) == 1
 
-    source = TARGET.read_text()
-    old, new = counts(source)
-    marker_count = source.count(MARK)
 
+def prepare_backend(source: str) -> tuple[str, str]:
+    old, new = backend_counts(source)
+    marker_count = source.count(BACKEND_MARK)
     if marker_count:
-        if marker_count != 1 or not verified_upstream_state(source):
-            raise SystemExit(
-                f"{TARGET}: partial/inconsistent xgrammar termination patch "
+        if marker_count != 1 or not verified_backend_state(source):
+            raise ValueError(
+                "partial/inconsistent xgrammar termination patch "
                 f"(marker={marker_count}, old={old}, new={new})"
             )
-        compile(source, str(TARGET), "exec")
-        print(f"{TARGET.name}: xgrammar termination patch already present")
-        return 0
-
-    # A newer image may already contain the exact merged upstream behavior.
-    # Accept that exact state without adding a recipe marker; any other drift
-    # remains fatal.
-    if verified_upstream_state(source):
-        compile(source, str(TARGET), "exec")
-        print(f"{TARGET.name}: upstream xgrammar termination fix already present")
-        return 0
-
+        return source, "already present"
+    if verified_backend_state(source):
+        return source, "already upstream"
     if old != [1, 1, 1] or new != [0, 0, 0]:
-        raise SystemExit(
-            f"{TARGET}: pinned xgrammar anchors drifted; refusing partial write "
+        raise ValueError(
+            "pinned xgrammar termination anchors drifted "
             f"(old={old}, new={new})"
         )
-
-    patched = source.replace(ACCEPT_OLD, MARK + ACCEPT_UPSTREAM, 1)
+    patched = source.replace(ACCEPT_OLD, BACKEND_MARK + ACCEPT_UPSTREAM, 1)
     patched = patched.replace(VALIDATE_OLD, VALIDATE_UPSTREAM, 1)
     patched = patched.replace(RESET_OLD, RESET_UPSTREAM, 1)
-    if not verified_upstream_state(patched) or patched.count(MARK) != 1:
-        raise SystemExit(f"{TARGET}: post-patch verification failed")
-    compile(patched, str(TARGET), "exec")
+    if not verified_backend_state(patched) or patched.count(BACKEND_MARK) != 1:
+        raise ValueError("xgrammar termination post-patch verification failed")
+    return patched, "patched"
 
-    tmp = TARGET.with_name(f".{TARGET.name}.glm53-xgrammar.tmp")
+
+def prepare_manager(source: str) -> tuple[str, str]:
+    old = source.count(MANAGER_OLD)
+    new = source.count(MANAGER_UPSTREAM)
+    marker_count = source.count(MANAGER_MARK)
+    if marker_count:
+        if marker_count != 1 or not verified_manager_state(source):
+            raise ValueError(
+                "partial/inconsistent xgrammar reasoning patch "
+                f"(marker={marker_count}, old={old}, new={new})"
+            )
+        return source, "already present"
+    if verified_manager_state(source):
+        return source, "already upstream"
+    if old != 1 or new != 0:
+        raise ValueError(
+            "pinned xgrammar reasoning anchor drifted "
+            f"(old={old}, new={new})"
+        )
+    patched = source.replace(MANAGER_OLD, MANAGER_MARK + MANAGER_UPSTREAM, 1)
+    if not verified_manager_state(patched) or patched.count(MANAGER_MARK) != 1:
+        raise ValueError("xgrammar reasoning post-patch verification failed")
+    return patched, "patched"
+
+
+def replace_file(target: Path, source: str) -> None:
+    tmp = target.with_name(f".{target.name}.glm53-xgrammar.tmp")
     try:
-        tmp.write_text(patched)
-        os.chmod(tmp, stat.S_IMODE(TARGET.stat().st_mode))
-        os.replace(tmp, TARGET)
+        tmp.write_text(source)
+        os.chmod(tmp, stat.S_IMODE(target.stat().st_mode))
+        os.replace(tmp, target)
     finally:
         if tmp.exists():
             tmp.unlink()
 
-    print(
-        f"patched {TARGET.name} "
-        "(vLLM #52805: stop XGrammar token batches at termination)"
-    )
+
+def main() -> int:
+    for target in (BACKEND_TARGET, MANAGER_TARGET):
+        if not target.is_file():
+            raise SystemExit(f"missing {target}")
+
+    backend_source = BACKEND_TARGET.read_text()
+    manager_source = MANAGER_TARGET.read_text()
+    try:
+        backend_patched, backend_action = prepare_backend(backend_source)
+        manager_patched, manager_action = prepare_manager(manager_source)
+    except ValueError as exc:
+        raise SystemExit(f"xgrammar patch preflight failed: {exc}") from exc
+
+    compile(backend_patched, str(BACKEND_TARGET), "exec")
+    compile(manager_patched, str(MANAGER_TARGET), "exec")
+
+    if backend_patched != backend_source:
+        replace_file(BACKEND_TARGET, backend_patched)
+    if manager_patched != manager_source:
+        replace_file(MANAGER_TARGET, manager_patched)
+
+    print(f"{BACKEND_TARGET.name}: termination fix {backend_action} (#52805)")
+    print(f"{MANAGER_TARGET.name}: reasoning fix {manager_action} (#53046)")
     return 0
 
 
