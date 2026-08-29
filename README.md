@@ -78,7 +78,7 @@ same path as the compact-64 fp8 serve (not NVFP4 KV).
 
 | Layer | Runtime |
 |---|---|
-| API | vLLM OpenAI (`/v1/chat/completions`) on the head, port **8888** |
+| API | vLLM OpenAI (`/v1/chat/completions`) on the head, port **8888**. Open by default; set `VLLM_API_KEY` for optional Bearer auth |
 | Weights | `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw` (mirror of `brandonmusic/…` snapshot `5ab363a8…`) |
 | Model id | `GLM-5.3-Flash-EXL3` (`--served-model-name`) |
 | Image | `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` FROM `vllm/vllm-openai:glm53-flash-arm64-cu130@sha256:905c0293…` (arm64, CUDA 13.0) |
@@ -319,6 +319,11 @@ BUILD=1 SKIP_DOWNLOAD=1 SKIP_SYNC=1 ./start.sh restart  # rebuild overlay from t
 Do not pull `glm53-flash-sm121:v8` — that is the older NVFP4/Ray kernel.
 
 API: `http://127.0.0.1:8888/v1` (LAN: `http://10.0.0.1:8888/v1`).
+`/v1` is unauthenticated unless you set `VLLM_API_KEY` in `.env` (opt-in;
+empty = no auth). vLLM reads the env var natively so the key never lands in
+argv. `/health` and `/metrics` stay unguarded. Restart after setting it.
+Clients then send `Authorization: Bearer <key>` on `/v1` (warmup already
+picks it up via `GLM53_WARMUP_BEARER`).
 
 ```bash
 curl -s http://127.0.0.1:8888/v1/chat/completions \
@@ -328,6 +333,9 @@ curl -s http://127.0.0.1:8888/v1/chat/completions \
     "messages": [{"role": "user", "content": "hello!"}],
     "chat_template_kwargs": {"enable_thinking": false}
   }'
+
+# with auth:
+# curl ... -H "Authorization: Bearer $VLLM_API_KEY" ...
 ```
 
 Thinking defaults on. Disable it with the **top-level** JSON field
@@ -383,6 +391,7 @@ that are now documented/enforced:
 | `IMAGE` | `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` | public GHCR tag; pulled on every start. `SKIP_PULL=1` skips. `BUILD=1` rebuilds the overlay |
 | `GHCR_TOKEN` / `GHCR_USER` | *(unset)* | optional login if anonymous GHCR pull is rate-limited |
 | `PORT` | `8888` | OpenAI API on the head |
+| `VLLM_API_KEY` | *(unset)* | opt-in Bearer token for `/v1`. Empty = open API. `/health` stays keyless |
 | `TP` / `NNODES` | `2` / `2` | do not change for this recipe |
 | `QUANTIZATION` | `exl3` | overlay method; never `marlin` |
 | `MTP_TOKENS` | `2` | MTP speculative tokens (`SPEC_METHOD=mtp`) |
