@@ -193,7 +193,7 @@ Live occupancy, temp **0**, thinking **off**, unique pads, `max_tokens=8`:
 | ~36k ×1 (padded slot-share) | 200 | **~16%** | — | one shared ID set |
 | ~36k ×3 concurrent | **3× 200** | **21%** (two in flight) | 54 / 96 / 137 s | `GLM53_MIXED_PREFILL_CHUNK=skip` still serializes prefills (`Running: 1`, others wait on capacity, then deferred) |
 | ~256k ×3 concurrent | **3× 200** | **29.5%** (two in flight) | 305 / 608 / 916 s | live on the 900k boot; 256,013 prompt tokens each, gen `OK`; third waited (skip) |
-| ~300k ×1 streamed | **200** | **26.0%** | **356 s** TTFT (~840 tok/s) | 299,213 prompt tokens, gen `OK`; ladder remeasure 2026-08-29: **323 s** TTFT (~928 tok/s) |
+| ~300k ×1 streamed | **200** | **26.0%** | **356 s** TTFT (~840 tok/s) | 299,213 prompt tokens, gen `OK`; MNBT=1024 remeasure **323 s** / ~928 tok/s; production MNBT=2048 **319 s** / **941** tok/s |
 
 Live **3×256k** held (the original failure). Prefills still serialize under skip; two 256k contexts were in KV at once at 29.5%. One 256k sat ~25%. Hybrid occupancy is a large length-independent floor (mamba + DFlash window) plus MLA pages that scale: 36k → 16%, 256k → ~25%, 300k → 26%.
 Default is **1M**. Do **not** drop `MAX_MODEL_LEN` to 256k to “free” slots —
@@ -224,23 +224,22 @@ does **not** let that group shrink the MLA+mamba hit. Mamba stays in the min
 (skipping a mamba miss is a correctness hole). Do not raise
 `--max-num-batched-tokens` to “fix” APC.
 
-**Live receipts** (thinking off, temp 0, real user + assistant + follow-up), 1M serve. Cold rungs and the ~8k follow-up are the 2026-08-29 cold-prefill ladder remeasure (`docs/cold-prefill.md`, KV pool 1,691,099 tok); the ~12k/~16k follow-ups and the 4× concurrent row are from the earlier same-day retest:
+**Live receipts** (thinking off, temp 0, real user + assistant + follow-up), 1M serve, **`MAX_NUM_BATCHED_TOKENS=2048`** (P1 keep; 3584/4096 reverted). Idle 8k/16k/100k are the dedicated keep A/B; 12k/256k/300k are the production full ladder. The MNBT=1024 baseline is `docs/cold-prefill.md`. ~12k/~16k follow-ups and the 4× concurrent row are the earlier same-day retest (chunk size does not change those hit counts). Details: `docs/improve-prefill.md`.
 
 | Turn | Hits | Compute | Prompt tok | TTFT | Prefill tok/s |
 |---|---:|---:|---:|---:|---:|
-| ~8k cold | 0 | 7995 | 7995 | 10.36 s | 772 |
-| ~8k follow-up | **7168** | 836 | 8004 | **1.30 s** | 6167 |
-| ~12k cold | 0 | 11995 | 11995 | 13.38 s | 896 |
+| ~8k cold | 0 | 7995 | 7995 | **8.93 s** | **895** |
+| ~8k follow-up | **7168** | 836 | 8004 | **1.27 s** | 6310 |
+| ~12k cold | 0 | 11995 | 11995 | 12.96 s | **926** |
 | ~12k follow-up | **10752** | 1263 | 12015 | **1.94 s** | — |
-| ~16k cold | 0 | 15995 | 15995 | 17.91 s | 893 |
+| ~16k cold | 0 | 15995 | 15995 | 16.78 s | **953** |
 | ~16k follow-up | **14336** | 1679 | 16015 | **2.18 s** | — |
-| ~100k cold | 0 | 99995 | 99995 | 105.6 s | 947 |
-| ~256k cold | 0 | 255995 | 255995 | 273.4 s | 936 |
-| ~300k cold | 0 | 299995 | 299995 | 323.2 s | 928 |
+| ~100k cold | 0 | 99995 | 99995 | 102.5 s | **975** |
+| ~256k cold | 0 | 255995 | 255995 | 263.2 s | **973** |
+| ~300k cold | 0 | 299995 | 299995 | 318.9 s | **941** |
 | 4× ~7.5k concurrent follow-ups | **7168 each** (28672 total) | rest | 7515 each | **1.86–2.50 s** | — |
 
-An ~8k follow-up reuses **7168 / 8004 ≈ 90%** of the prompt (earlier retest: 93% of 7717), not 46%.
-Long colds got faster vs the 2026-08-28 receipts: ~256k 305 s / ~839 → **273 s / 936**, ~300k 356 s / ~840 → **323 s / 928**.
+An ~8k follow-up still reuses **7168 / 8004 ≈ 90%** of the prompt, not 46%. MNBT=2048 vs the 1024 ladder: ~8k 10.36 s / 772 → **8.93 s / 895**; ~100k 105.6 s / 947 → **102.5 s / 975**; ~256k 273 s / 936 → **263 s / 973**; ~300k 323 s / 928 → **319 s / 941**. Coarser decode interleave (2k-token chunks vs 1k).
 Hits work **below** UserHIJ’s 14,336-token floor (that floor is 896-chunk ×
 2048-align LCM on a different geometry; this kit’s 3584 is 4×896). Isolation
 held (`STILL_READY_S` / `STILL_C0`…`C3`). Idle chats are not reserved; after
