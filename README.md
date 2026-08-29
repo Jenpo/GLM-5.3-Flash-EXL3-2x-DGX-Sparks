@@ -208,8 +208,7 @@ does **not** let that group shrink the MLA+mamba hit. Mamba stays in the min
 (skipping a mamba miss is a correctness hole). Do not raise
 `--max-num-batched-tokens` to “fix” APC.
 
-Live multi-turn, temp **0**, thinking **off**, real chat history
-(`user` + `assistant` + follow-up `user`), 1M serve:
+**Live retest** (thinking off, temp 0, real user + assistant + follow-up), 1M serve:
 
 | Turn | Hits | Compute | Prompt tok | TTFT |
 |---|---:|---:|---:|---:|
