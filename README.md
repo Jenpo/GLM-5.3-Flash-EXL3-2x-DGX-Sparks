@@ -124,6 +124,17 @@ checkpoint `is_causal: false` so draft attention is bidirectional inside the
 block. Draft KV is forced `auto` because dense DFlash2 cannot use the target's
 `fp8_ds_mla` layout and SM121 has no FA3/FA4 for plain FP8.
 
+The pinned vLLM `487ecf187` also predates the merged XGrammar speculative-batch
+termination fix. `overlay/patch_xgrammar_termination.py` is a source-exact
+behavioral backport of [vLLM PR #52805](https://github.com/vllm-project/vllm/pull/52805)
+([commit `12f64b39`](https://github.com/vllm-project/vllm/commit/12f64b39d29282437e35be9aa5db432fb2a1a6e6)).
+It stops `accept_tokens()` and `validate_tokens()` at the first terminating
+token, ignores later advances after termination, and clears the cached flag on
+reset. The fail-closed, idempotent script is mounted and run on both ranks. This
+fixes the matcher-after-stop defect in issue #19; it does not reinterpret an
+invalid client request that combines GLM XML tool output with a JSON response
+schema, nor does it remove cold-prefill queue time.
+
 `overlay/patch_glm_video_placeholders.py` routes Glm5Next video timestamps through
 the glm46v path and aligns placeholder blocks to encoder `grid_t`. The overlay
 also disables GB10 `persistent_topk` so long-history decode uses
@@ -407,6 +418,8 @@ this Dockerfile instead. After CUDA compile, Python overlay edits
 | `overlay/patch_glm_video_placeholders.py` | align video timestamp blocks to encoder `grid_t` |
 | `overlay/patch_suppress_stops_in_reasoning.py` | fail-closed detokenizer guard: client `stop` dormant until `</think>` |
 | `overlay/patch_scheduler_decode_floor.py` | skip (or cap) peer prefill while another seq is decoding |
+| `overlay/patch_xgrammar_termination.py` | source-exact vLLM #52805 backport; stop speculative XGrammar batches at termination |
+| `tests/test_xgrammar_termination.py` | exact patch, idempotence, fail-closed drift, termination/rollback/reset behavior, launcher wiring |
 | `scripts/boot-shape-warmup.sh` | post-`/health` DFlash2 k=7 BLOCK ladder + sampler/kpool arms |
 
 Image-build runs `EXL3_SELFCHECK_GPU=0`. `./start.sh` runs the GPU self-check
