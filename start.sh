@@ -191,6 +191,12 @@ VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}"
 GLM53_BOOT_SHAPE_WARMUP="${GLM53_BOOT_SHAPE_WARMUP:-1}"
 GLM53_WARMUP_REQ_TIMEOUT="${GLM53_WARMUP_REQ_TIMEOUT:-240}"
 
+# OpenAI-compatible API bearer token. Read the native VLLM_API_KEY env var
+# (vLLM falls back to it when --api-key is absent on the CLI), so the key
+# never lands in argv / `non-default args` startup log. Empty = no auth.
+# Same single-key semantics as the DeepSeek V4 Flash DSpark deployment.
+VLLM_API_KEY="${VLLM_API_KEY:-}"
+
 CONTAINER_HEAD="${CONTAINER_HEAD:-glm53-exl3-head}"
 CONTAINER_WORKER="${CONTAINER_WORKER:-glm53-exl3-worker}"
 
@@ -921,6 +927,12 @@ launch_cluster() {
              LIMIT_MM CHAT_TEMPLATE ENFORCE_EAGER EXL3_FUSED_MOE MODEL_DIR EXTRA_ARGS; do
         serve_env+=" -e $v='${!v:-}'"
     done
+    # VLLM_API_KEY is read by the head (rank 0) API server for bearer auth; the
+    # worker runs --headless so it only needs the var for argv-parity, and
+    # start.sh below passes it explicitly on the head. Keep it out of the
+    # generic loop so the key never shows in process listings of either node
+    # beyond the container env (same as the DeepSeek deployment).
+    serve_env+=" -e VLLM_API_KEY='${VLLM_API_KEY:-}'"
 
     log "starting worker on ${WORKER_SSH} (NCCL if=${WORKER_CX7_IF} hca=${WORKER_CX7_IB}) ..."
     worker_ssh "docker run -d --name '$CONTAINER_WORKER' \
@@ -990,6 +1002,7 @@ launch_cluster() {
         -e ENFORCE_EAGER="$ENFORCE_EAGER" \
         -e EXL3_FUSED_MOE="$EXL3_FUSED_MOE" \
         -e MODEL_DIR="$MODEL_DIR" \
+        -e VLLM_API_KEY="$VLLM_API_KEY" \
         -e EXTRA_ARGS="${EXTRA_ARGS:-}" \
         --entrypoint bash "$IMAGE" /start.sh >/dev/null
 
@@ -1071,8 +1084,16 @@ on_ready() {
     [ "$SPEC_METHOD" = "dflash" ] && spec="DFlash2 k=${DFLASH_TOKENS} (${DFLASH_MODEL})"
     [ "$SPEC_METHOD" = "none" ] && spec=off
     log "  features   : tools=glm47+auto, reasoning=glm45, spec=${spec}, vision=${vision}"
+    local auth_line="none (VLLM_API_KEY empty)"
+    if [ -n "${VLLM_API_KEY:-}" ]; then
+        auth_line="bearer token set (VLLM_API_KEY) — send Authorization: Bearer <key> on /v1 requests"
+    fi
+    log "  auth       : ${auth_line}"
     log "  quick test :"
     log "    curl -s http://127.0.0.1:${PORT}/v1/chat/completions \\"
+    if [ -n "${VLLM_API_KEY:-}" ]; then
+        log "      -H 'Authorization: Bearer <KEY>' \\"
+    fi
     log "      -H 'Content-Type: application/json' \\"
     log "      -d '{\"model\": \"${SERVED_MODEL_NAME}\", \"messages\": [{\"role\": \"user\", \"content\": \"hello!\"}]}'"
     log "  manage     : ./start.sh status | ./start.sh logs | ./start.sh logs worker | ./start.sh stop"
