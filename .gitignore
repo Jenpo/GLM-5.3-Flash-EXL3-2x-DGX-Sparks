@@ -7,3 +7,6 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
+
+# bench artifacts (prefix-cache runs write here)
+results/
