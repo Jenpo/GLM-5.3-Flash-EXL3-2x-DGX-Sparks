@@ -111,8 +111,7 @@ This overlay is based on [@u1tra_instinct](https://x.com/u1tra_instinct)'s
 files. Artifacts live in `ablit/` (from
 [drowzeys/keys-GLM-5.3-Flash-NVFP4-ablit-l15-45-anchorstock](https://huggingface.co/drowzeys/keys-GLM-5.3-Flash-NVFP4-ablit-l15-45-anchorstock),
 method `dealign-oproj-transplant`: layers **15–45** edited, **0–14 stock**
-safety anchors, MTP block included). Dedicated overlay repo:
-[AblitBrench](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-AblitBrench).
+safety anchors, MTP block included).
 
 **Method — `ABLIT_METHOD=transplant` (default via `auto`).** The published
 checkpoint's `o_proj` L15–45 are byte-copied from the donor
