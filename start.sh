@@ -149,11 +149,12 @@ SPEC_METHOD="${SPEC_METHOD:-dflash}"
 DFLASH_MODEL="${DFLASH_MODEL:-incoai/GLM-5.3-Flash-DFlash2}"
 DFLASH_CACHE_NAME="${DFLASH_CACHE_NAME:-models--${DFLASH_MODEL//\//--}}"
 DFLASH_TOKENS="${DFLASH_TOKENS:-7}"
-# 1 = keep the ~2.3 GiB drafter on rank 0 (no CX7 on every draft step).
-# Empty = inherit target TP. Do not pin attention_backend: SM121 already
-# prefers FLASH_ATTN for non-causal dense SWA. TRITON_ATTN was an SM120
-# mask-fix copy this image does not have.
-DFLASH_DRAFT_TP="${DFLASH_DRAFT_TP-1}"
+# 2 = shard the ~2.3 GiB DFlash2 drafter across TP (C4 keep, 2026-08-30:
+# idle 8k 938 / 16k 972 / 100k 997; decode structured 65.1 / prose 27.1).
+# 1 = rank 0 only (no CX7 on every draft step). Empty = inherit target TP.
+# Do not pin attention_backend: SM121 already prefers FLASH_ATTN for
+# non-causal dense SWA. TRITON_ATTN was an SM120 mask-fix this image lacks.
+DFLASH_DRAFT_TP="${DFLASH_DRAFT_TP-2}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-1000000}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.87}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"

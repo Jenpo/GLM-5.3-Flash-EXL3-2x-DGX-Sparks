@@ -469,7 +469,7 @@ that are now documented/enforced:
 | `SPEC_METHOD` | `dflash` | `dflash` / `mtp` / `none`. Rollback: `SPEC_METHOD=mtp ./start.sh restart` |
 | `DFLASH_MODEL` | `incoai/GLM-5.3-Flash-DFlash2` | DFlash2 draft Hub repo (~2.3 GiB BF16) |
 | `DFLASH_TOKENS` | `7` | DFlash2 speculative tokens (trained block 8) |
-| `DFLASH_DRAFT_TP` | `1` | keep the 2.3 GiB drafter on rank 0 (no CX7 per draft step). Empty = inherit TP |
+| `DFLASH_DRAFT_TP` | `2` | shard DFlash2 across TP (C4 keep: 8k 938 / decode 65.1). `1` = rank 0 only. Empty = inherit TP |
 | DFlash2 draft KV | `auto` (bf16) | target stays `fp8`/`fp8_ds_mla`; dense draft has no MLA FP8 backend on SM121 |
 | DFlash2 attention | *(unset)* | SM121 picks FLASH_ATTN for non-causal SWA. Do not pin `TRITON_ATTN` |
 | `ENFORCE_EAGER` | `0` | CUDA graphs; MTP capture `1 2 3 4 6 8 12`, DFlash2 `1 2 4 8 16 24 32` |
