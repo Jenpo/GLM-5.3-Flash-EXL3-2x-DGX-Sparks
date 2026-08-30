@@ -124,6 +124,11 @@ HEAD_CX7_IB="${HEAD_CX7_IB:-rocep1s0f1}"
 WORKER_CX7_IB="${WORKER_CX7_IB:-rocep1s0f0}"
 NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
+# The RoCEv2 GID index is per-NIC: the usable entry is the one whose GID matches
+# that node's own fabric IP. Most pairs share a good index; some do not (this kit
+# needs head=4, worker=3). Unset, both inherit NCCL_IB_GID_INDEX -> unchanged.
+HEAD_GID="${HEAD_GID:-$NCCL_IB_GID_INDEX}"
+WORKER_GID="${WORKER_GID:-$NCCL_IB_GID_INDEX}"
 # vLLM subtracts a CUDA-graph memory ESTIMATE from the KV pool. On this kit the
 # estimate is 2.43 GiB while the captured graphs actually consume -0.19 GiB, so
 # ~2.6 GiB of KV is reserved and never used. 0 keeps CUDA graphs ON and drops only
@@ -350,24 +355,32 @@ preflight() {
     worker_ssh "nvidia-smi -L 2>/dev/null | grep -q GB10" \
         || warn "no GB10 GPU visible on worker"
 
-    # NCCL_IB_GID_INDEX must name a populated GID on BOTH nodes' CX7 devices.
-    # An empty (all-zero) entry passes every earlier check and then kills the
-    # worker rank ~60 s in with ibv_modify_qp errno 61 "No data available" —
-    # kits differ: on some GB10 pairs gid 3 is populated on one node and
-    # all-zero on the other. Fail here, in seconds, with the fix in hand.
+    # Each rank's GID index must name a populated entry on ITS OWN CX7 device.
+    # An empty (all-zero) entry passes every earlier check and then kills that
+    # rank ~60 s in with ibv_modify_qp errno 61 "No data available". The index is
+    # per-NIC, so validate head and worker separately: some pairs share one good
+    # index, others need different ones (HEAD_GID / WORKER_GID).
     local gid_head gid_worker gid_path
-    gid_path="/sys/class/infiniband/${HEAD_CX7_IB}/ports/1/gids/${NCCL_IB_GID_INDEX}"
+    gid_path="/sys/class/infiniband/${HEAD_CX7_IB}/ports/1/gids/${HEAD_GID}"
     gid_head=$(cat "$gid_path" 2>/dev/null | tr -d ':0' || true)
-    gid_path="/sys/class/infiniband/${WORKER_CX7_IB}/ports/1/gids/${NCCL_IB_GID_INDEX}"
+    gid_path="/sys/class/infiniband/${WORKER_CX7_IB}/ports/1/gids/${WORKER_GID}"
     gid_worker=$(worker_ssh "cat '$gid_path' 2>/dev/null" | tr -d ':0' || true)
     if [ -z "$gid_head" ] || [ -z "$gid_worker" ]; then
-        warn "NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX} is EMPTY on $( [ -z "$gid_head" ] && echo "head(${HEAD_CX7_IB})" ) $( [ -z "$gid_worker" ] && echo "worker(${WORKER_CX7_IB})" )"
-        warn "GID tables (pick an index whose entry is non-zero on BOTH nodes — the ::ffff:<ip> RoCEv2 one):"
-        for i in 0 1 2 3; do
-            printf '    head   gid%s: %s\n' "$i" "$(cat "/sys/class/infiniband/${HEAD_CX7_IB}/ports/1/gids/$i" 2>/dev/null)" >&2
+        if [ -z "$gid_head" ]; then
+            warn "head GID index ${HEAD_GID} is EMPTY on ${HEAD_CX7_IB}"
+        fi
+        if [ -z "$gid_worker" ]; then
+            warn "worker GID index ${WORKER_GID} is EMPTY on ${WORKER_CX7_IB}"
+        fi
+        warn "GID tables — pick each node's ::ffff:<ip> entry whose type is RoCE v2;"
+        warn "the two indices need not match, and a v1 entry at the same index will not work:"
+        for i in 0 1 2 3 4 5 6 7; do
+            printf '    head   gid%s: %-40s %s\n' "$i" \
+                "$(cat "/sys/class/infiniband/${HEAD_CX7_IB}/ports/1/gids/$i" 2>/dev/null)" \
+                "$(cat "/sys/class/infiniband/${HEAD_CX7_IB}/ports/1/gid_attrs/types/$i" 2>/dev/null)" >&2
         done
-        worker_ssh "for i in 0 1 2 3; do printf '    worker gid%s: %s\n' \"\$i\" \"\$(cat /sys/class/infiniband/${WORKER_CX7_IB}/ports/1/gids/\$i 2>/dev/null)\"; done" >&2 || true
-        die "set NCCL_IB_GID_INDEX in .env to a populated index (this kills the worker rank with ibv_modify_qp errno 61 otherwise)"
+        worker_ssh "for i in 0 1 2 3 4 5 6 7; do printf '    worker gid%s: %-40s %s\n' \"\$i\" \"\$(cat /sys/class/infiniband/${WORKER_CX7_IB}/ports/1/gids/\$i 2>/dev/null)\" \"\$(cat /sys/class/infiniband/${WORKER_CX7_IB}/ports/1/gid_attrs/types/\$i 2>/dev/null)\"; done" >&2 || true
+        die "set NCCL_IB_GID_INDEX (same index both ranks) or HEAD_GID/WORKER_GID (per rank) in .env to populated indices"
     fi
 
     [ "$TP" = "2" ] || warn "TP=${TP} on a 2×1-GPU cluster — expected TP=2"
@@ -992,7 +1005,6 @@ launch_cluster() {
     local -a nccl_common=(
         -e NCCL_IB_DISABLE=0
         -e NCCL_IB_ROCE_VERSION_NUM=2
-        -e "NCCL_IB_GID_INDEX=$NCCL_IB_GID_INDEX"
         -e NCCL_NET=IB
         -e NCCL_NET_PLUGIN=none
         -e NCCL_NVLS_ENABLE=0
@@ -1087,6 +1099,7 @@ launch_cluster() {
         -e NCCL_SOCKET_IFNAME='$WORKER_CX7_IF' \
         -e GLOO_SOCKET_IFNAME='$WORKER_CX7_IF' \
         -e NCCL_IB_HCA='$WORKER_CX7_IB' \
+        -e NCCL_IB_GID_INDEX='$WORKER_GID' \
         -e VLLM_HOST_IP='$WORKER_IP' \
         ${serve_env} \
         --entrypoint bash '$IMAGE' /start.sh" >/dev/null
@@ -1117,6 +1130,7 @@ launch_cluster() {
         -e NCCL_SOCKET_IFNAME="$HEAD_CX7_IF" \
         -e GLOO_SOCKET_IFNAME="$HEAD_CX7_IF" \
         -e NCCL_IB_HCA="$HEAD_CX7_IB" \
+        -e NCCL_IB_GID_INDEX="$HEAD_GID" \
         -e VLLM_HOST_IP="$HEAD_IP" \
         -e SERVED_MODEL_NAME="$SERVED_MODEL_NAME" \
         -e PORT="$PORT" -e TP="$TP" -e NNODES="$NNODES" \
