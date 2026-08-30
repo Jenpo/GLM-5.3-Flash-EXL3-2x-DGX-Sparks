@@ -38,7 +38,7 @@ Official numbers: sparkDash Decode bench, DFlash2 k=7, **Structured** (count 1�
 
 Serve recipe is `--max-model-len 1000000` with KV pool **1,754,237** tokens (1.75× a full 1M request) at util 0.87. These runs are warm / empty KV — they do not need a filled 1M cache.
 
-Lab `tests/bench_decode.py` on the same protocol (median of 5 × 400, C1): Structured **61.7** tok/s (0.918 accept / 6.43 per step); Prose (hash-map) **26.9** (0.332 / 2.33). Long context / mixed (~60–100k KV) 24–27. MTP k=2 baseline ~24.6.
+Lab `tests/bench_decode.py` on the same protocol (median of 5 × 400, 2026-08-30 C4, `DFLASH_DRAFT_TP=2`): Structured **65.1** tok/s (0.959 accept / 6.71 per step); Prose (hash-map) **27.1** (0.341 / 2.39). Prior TP=1 lab: 61.7 / 26.9. Long context / mixed (~60–100k KV) 24–27. MTP k=2 baseline ~24.6.
 
 Structured per-pos (lab median): **0.98 / 0.98 / 0.94 / 0.94 / 0.91 / 0.83 / 0.83**.
 Prose per-pos: **0.75 / 0.58 / 0.41 / 0.28 / 0.16 / 0.09 / 0.06**.
@@ -272,7 +272,7 @@ Keep **`SKIP_MM_PROFILING=1`** — a max-size image+video dummy profile OOMs thi
 **NVFP4 KV is not available here.** FlashInfer’s SM12x NVFP4 kernels are dense MHA,
 not sparse MLA. Do not confuse that with NVFP4 **weights** (`--moe-backend marlin`).
 
-## Prefix caching (this kit, 2026-08-29)
+## Prefix caching (this kit, 2026-08-30)
 
 `--enable-prefix-caching` is on. The OpenAI API is **stateless**: the client
 resends the full history each turn; vLLM hashes that prefix. Concurrent chats
@@ -290,22 +290,22 @@ does **not** let that group shrink the MLA+mamba hit. Mamba stays in the min
 (skipping a mamba miss is a correctness hole). Do not raise
 `--max-num-batched-tokens` to “fix” APC.
 
-**Live receipts** (thinking off, temp 0, real user + assistant + follow-up), 1M serve, **`MAX_NUM_BATCHED_TOKENS=2048`** (P1 keep; 3584/4096 reverted). Idle 8k/16k/100k are the dedicated keep A/B; 12k/256k/300k are the production full ladder. The MNBT=1024 baseline is `docs/cold-prefill.md`. ~12k/~16k follow-ups and the 4× concurrent row are the earlier same-day retest (chunk size does not change those hit counts). Details: `docs/improve-prefill.md`.
+**Live receipts** (thinking off, temp 0, unique pads), 1M serve, **`MAX_NUM_BATCHED_TOKENS=2048`** (P1 keep; 3584/4096 reverted), **`DFLASH_DRAFT_TP=2`**. Idle 8k/16k/100k are the 2026-08-30 C4 keep A/B. 12k/256k/300k and the concurrent follow-ups are the prior TP=1 production ladder (chunk size does not change those hit counts). The MNBT=1024 baseline is `docs/cold-prefill.md`. Details: `docs/improve-prefill.md`.
 
 | Turn | Hits | Compute | Prompt tok | TTFT | Prefill tok/s |
 |---|---:|---:|---:|---:|---:|
-| ~8k cold | 0 | 7995 | 7995 | **8.93 s** | **895** |
-| ~8k follow-up | **7168** | 836 | 8004 | **1.27 s** | 6310 |
+| ~8k cold | 0 | 7995 | 7995 | **8.53 s** | **938** |
+| ~8k follow-up | **7168** | 836 | 8004 | **1.30 s** | 6177 |
 | ~12k cold | 0 | 11995 | 11995 | 12.96 s | **926** |
 | ~12k follow-up | **10752** | 1263 | 12015 | **1.94 s** | — |
-| ~16k cold | 0 | 15995 | 15995 | 16.78 s | **953** |
+| ~16k cold | 0 | 15995 | 15995 | **16.45 s** | **972** |
 | ~16k follow-up | **14336** | 1679 | 16015 | **2.18 s** | — |
-| ~100k cold | 0 | 99995 | 99995 | 102.5 s | **975** |
+| ~100k cold | 0 | 99995 | 99995 | **100.3 s** | **997** |
 | ~256k cold | 0 | 255995 | 255995 | 263.2 s | **973** |
 | ~300k cold | 0 | 299995 | 299995 | 318.9 s | **941** |
 | 4× ~7.5k concurrent follow-ups | **7168 each** (28672 total) | rest | 7515 each | **1.86–2.50 s** | — |
 
-An ~8k follow-up still reuses **7168 / 8004 ≈ 90%** of the prompt, not 46%. MNBT=2048 vs the 1024 ladder: ~8k 10.36 s / 772 → **8.93 s / 895**; ~100k 105.6 s / 947 → **102.5 s / 975**; ~256k 273 s / 936 → **263 s / 973**; ~300k 323 s / 928 → **319 s / 941**. Coarser decode interleave (2k-token chunks vs 1k).
+An ~8k follow-up still reuses **7168 / 8004 ≈ 90%** of the prompt, not 46%. MNBT=2048 vs the 1024 ladder (draft TP=1): ~8k 10.36 s / 772 → 8.93 s / 895; ~100k 105.6 s / 947 → 102.5 s / 975; ~256k 273 s / 936 → **263 s / 973**; ~300k 323 s / 928 → **319 s / 941**. C4 keep (`DFLASH_DRAFT_TP=2`): ~8k **8.53 s / 938**; ~16k **16.45 s / 972**; ~100k **100.3 s / 997**. Coarser decode interleave (2k-token chunks vs 1k).
 Hits work **below** UserHIJ’s 14,336-token floor (that floor is 896-chunk ×
 2048-align LCM on a different geometry; this kit’s 3584 is 4×896). Isolation
 held (`STILL_READY_S` / `STILL_C0`…`C3`). Idle chats are not reserved; after
