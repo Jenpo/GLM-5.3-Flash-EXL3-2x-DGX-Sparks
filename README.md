@@ -95,6 +95,7 @@ same path as the compact-64 fp8 serve (not NVFP4 KV).
 | Tools / reasoning | `--tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm45` |
 | Graphs | on (`ENFORCE_EAGER=0`) — MTP capture `1 2 3 4 6 8 12`; DFlash2 capture `1 2 4 8 16 24 32` |
 | Vision | on (`LANGUAGE_MODEL_ONLY=0`) — image + video, `--limit-mm-per-prompt {image:4,video:1}`, `--skip-mm-profiling` |
+| Ablit | **off** (`ABLIT=0`). Stock `o_proj`. Set `ABLIT=1` to enable; see [Abliteration](#abliteration-ablit1) |
 
 Kernels: `TORCH_CUDA_ARCH_LIST=12.1a`. ExLlamaV3 pin `c5d9c657` (0.0.43) exposes
 `exl3_moe` / `exl3_moe_max_concurrency`; aarch64 CPU allreduce stubs in
@@ -102,9 +103,12 @@ Kernels: `TORCH_CUDA_ARCH_LIST=12.1a`. ExLlamaV3 pin `c5d9c657` (0.0.43) exposes
 
 ## Abliteration (`ABLIT=1`)
 
-Opt-in refusal-direction ablation at weight-load on top of the EXL3 checkpoint —
-nothing on disk is rewritten. Default is **off** (`ABLIT=0`); stock o_proj
-weights. Artifacts live in `ablit/` (from
+**Off by default.** Unset or `ABLIT=0` serves stock `o_proj`. `ABLIT=1` is
+opt-in refusal-direction ablation at weight-load on top of the EXL3 checkpoint
+— nothing on disk is rewritten.
+
+This overlay is based on [@u1tra_instinct](https://x.com/u1tra_instinct)'s
+files. Artifacts live in `ablit/` (from
 [drowzeys/keys-GLM-5.3-Flash-NVFP4-ablit-l15-45-anchorstock](https://huggingface.co/drowzeys/keys-GLM-5.3-Flash-NVFP4-ablit-l15-45-anchorstock),
 method `dealign-oproj-transplant`: layers **15–45** edited, **0–14 stock**
 safety anchors, MTP block included). Dedicated overlay repo:
@@ -151,7 +155,7 @@ rebuild: artifacts + hook are bind-mounted into both containers every start.
 
 | Knob | Default | What |
 |---|---|---|
-| `ABLIT` | `0` | `1` = apply the o_proj edit at load (both ranks) |
+| `ABLIT` | `0` (off) | `1` = apply the o_proj edit at load (both ranks). Default and unset = stock weights |
 | `ABLIT_METHOD` | `auto` | `auto` = transplant when `ablit/transplant/` is populated, else `proj` \| `transplant` \| `proj` |
 | `ABLIT_LAYERS` | `15-45` | inclusive range; `45` is the checkpoint MTP block |
 | `ABLIT_ALPHA` | `3.0` | proj-only: projection scale (`1.0` = plain projection) |
@@ -454,7 +458,7 @@ that are now documented/enforced:
 | `GHCR_TOKEN` / `GHCR_USER` | *(unset)* | optional login if anonymous GHCR pull is rate-limited |
 | `PORT` | `8888` | OpenAI API on the head |
 | `VLLM_API_KEY` | *(unset)* | opt-in Bearer token for `/v1`. Empty = open API. `/health` stays keyless |
-| `ABLIT` | `0` | `1` = apply o_proj edit at load (both ranks). Stock weights when unset |
+| `ABLIT` | `0` (off) | opt-in. `1` = apply o_proj edit at load (both ranks). Unset = stock weights |
 | `ABLIT_METHOD` | `auto` | `auto` = transplant when `ablit/transplant/` is populated, else `proj` |
 | `ABLIT_LAYERS` | `15-45` | inclusive range; `45` is the checkpoint MTP block |
 | `ABLIT_DIRECTION` | `dealign` | proj-only: `dealign` \| `bf_oproj` \| path to a custom `.pt` |
@@ -560,6 +564,8 @@ DFlash2 stays [CC BY-NC-ND 4.0](https://huggingface.co/incoai/GLM-5.3-Flash-DFla
   (CC BY-NC-ND 4.0, research/eval)
 - **KLD panel:** [malaiwah](https://huggingface.co/malaiwah) —
   [discussion #1](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw/discussions/1#6a9144846b0bdba943bfe86f)
+- **Abliteration basis:** [@u1tra_instinct](https://x.com/u1tra_instinct) —
+  this overlay is based on their files
 - **Abliteration recipe / direction artifacts:** [drowzeys](https://huggingface.co/drowzeys) —
   [keys-GLM-5.3-Flash-NVFP4-ablit-l15-45-anchorstock](https://huggingface.co/drowzeys/keys-GLM-5.3-Flash-NVFP4-ablit-l15-45-anchorstock)
 - **Abliteration donor weights:** [dealignai](https://huggingface.co/dealignai) —
