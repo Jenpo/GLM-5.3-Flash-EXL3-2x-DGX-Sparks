@@ -206,6 +206,14 @@ mounted and run on both ranks. These address issue #19's matcher-error paths;
 they do not reinterpret a client request that combines GLM XML tool output
 with a JSON response schema, nor do they remove cold-prefill queue time.
 
+`overlay/patch_kpool_tail_slotmap.py` clamps the generic paged slot-map kernel
+so `KpoolTailSpec`'s one-block circular scratch cannot index past its single
+block-table entry. Without that clamp, every token at `pos >= block_size`
+fills the mapping with adjacent memory and the kpool seed/update kernels
+write through it — long generations (~2k tokens) crash or silently corrupt
+another layer's indexer. The clamp is identity for every other KV group.
+Fail-closed, idempotent, mounted and run on both ranks.
+
 `overlay/patch_glm_video_placeholders.py` routes Glm5Next video timestamps through
 the glm46v path and aligns placeholder blocks to encoder `grid_t`. The overlay
 also disables GB10 `persistent_topk` so long-history decode uses
@@ -523,6 +531,8 @@ this Dockerfile instead. After CUDA compile, Python overlay edits
 | `overlay/patch_scheduler_decode_floor.py` | skip (or cap) peer prefill while another seq is decoding |
 | `overlay/patch_xgrammar_termination.py` | source-exact vLLM #52805/#53046 backports; stop at termination and validate post-reasoning speculative drafts before FSM advance |
 | `tests/test_xgrammar_termination.py` | exact two-file patch, idempotence, cross-file fail-closed drift, termination/rollback/reset and post-reasoning draft behavior, launcher wiring |
+| `overlay/patch_kpool_tail_slotmap.py` | clamp KpoolTail one-block circular slot mapping; identity for other KV groups |
+| `tests/test_kpool_tail_slotmap.py` | circular addressing math, exact kernel patch, idempotence, fail-closed drift, launcher wiring |
 | `overlay/ablit_runtime.py` | load-time o_proj transplant / projection (`ABLIT=1`); no-op when off |
 | `overlay/patch_ablit.py` | install the load_weights hook; bind-mounted and run on both ranks |
 | `ablit/` | direction vectors + `LAYER_MAP.json` from drowzeys' published recipe; `fetch_transplant.py` + `transplant/` for the donor o_proj byte-copy |
